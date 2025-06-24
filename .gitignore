@@ -192,3 +192,26 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Dagster
+dagster_home/
+.dagster/
+.dagster_home/
+dagster.yaml
+workspace.yaml
+# Storage directories
+dagster_storage/
+storage/
+runs/
+events/
+schedules/
+
+# Data files (adjust based on your project)
+data/
+*.csv
+*.parquet
+*.json
+logs/
+*.log
+tmp/
+temp/
