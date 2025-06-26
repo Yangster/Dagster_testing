@@ -1,17 +1,17 @@
 import pandas as pd
-import smartsheet
+# import smartsheet
 import datetime as dt
 import os
 import re
 from pathlib import Path
 from dagster import asset, AssetExecutionContext, Config, MaterializeResult, MetadataValue
-from typing import Optional
+# from typing import Optional
 
 
 class SmartsheetConfig(Config):
     """Configuration for Smartsheet connection"""
     sheet_name: str = "Economic Curtailment Thresholds"
-    bearer_token_env_var: str = "SMARTSHEETS_TOKEN"
+    # bearer_token_env_var: str = "SMARTSHEETS_TOKEN"
 
 
 class DataConfig(Config):
@@ -55,7 +55,8 @@ def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: 
 )
 def raw_smartsheet_data(
     context: AssetExecutionContext, 
-    config: SmartsheetConfig
+    config: SmartsheetConfig,
+    smartsheet_client
 ) -> MaterializeResult:
     """
     Extract raw economic curtailment threshold data from Smartsheet and save to CSV.
@@ -66,13 +67,14 @@ def raw_smartsheet_data(
     context.log.info(f"Starting extraction from sheet: {config.sheet_name}")
     
     # Get bearer token from environment
-    bearer = os.environ.get(config.bearer_token_env_var)
-    if not bearer:
-        raise ValueError(f"Environment variable {config.bearer_token_env_var} not found")
+    # should be in resource
+    # bearer = os.environ.get(config.bearer_token_env_var)
+    # if not bearer:
+    #     raise ValueError(f"Environment variable {config.bearer_token_env_var} not found")
     
-    # Create Smartsheet client with SSL configuration
-    import ssl
-    import urllib3
+    # # Create Smartsheet client with SSL configuration
+    # import ssl
+    # import urllib3
     
     # Multiple approaches to handle SSL issues in corporate environments
     # try:
@@ -97,7 +99,7 @@ def raw_smartsheet_data(
     #     context.log.warning(f"SSL configuration failed: {ssl_error}")
     # Fallback: create client normally and hope for the best
     # make sure wer'e in dagster2 env of other env with openslll 1.1.1
-    ss_client = smartsheet.Smartsheet(f"Bearer {bearer}")
+    ss_client = smartsheet_client.get_client()
     
     # Get all sheets and find the target sheet
     context.log.info("Retrieving sheet list from Smartsheet...")

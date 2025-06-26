@@ -10,8 +10,8 @@ from typing import Optional
 
 class PIWebAPIConfig(Config):
     """Configuration for PI Web API connection"""
-    database_webid: str = "F1RDfBX_hedyUEKNiDBi2ij-swoeupCWwgO0Sod5PaUcAa2wRUdQTkEtQkEtQUZcRUdQTkE"
-    base_url: str = "https://egpna-pi-web.enelint.global/piwebapi"
+    # database_webid: str = "F1RDfBX_hedyUEKNiDBi2ij-swoeupCWwgO0Sod5PaUcAa2wRUdQTkEtQkEtQUZcRUdQTkE"
+    # base_url: str = "https://egpna-pi-web.enelint.global/piwebapi"
     table_name: str = "Economic_Curtailment_Prices_Solar"
 
 
@@ -39,20 +39,13 @@ def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: 
 )
 def pi_table_webid(
     context: AssetExecutionContext,
-    config: PIWebAPIConfig
-) -> MaterializeResult:
+    config: PIWebAPIConfig,
+    pi_webapi_client
+    ) -> MaterializeResult:
     """Find and return the WebID for the PI Web API table"""
     
-    kerberos_auth = HTTPKerberosAuth(mutual_authentication=DISABLED)
-    headers = {
-        "Host": "egpna-pi-web",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/json",
-    }
-    
-    query_url = f"{config.base_url}/assetdatabases/{config.database_webid}/tables"
-    
-    response = requests.get(query_url, auth=kerberos_auth, headers=headers, verify=True)
+    endpoint = f"/assetdatabases/{pi_webapi_client.database_webid}/tables"
+    response = pi_webapi_client.make_request("GET", endpoint)
     
     if response.status_code not in (200, 207):
         raise ValueError(f"Failed to get tables: {response.status_code}")
@@ -89,7 +82,7 @@ def pi_table_webid(
 )
 def existing_pi_data(
     context: AssetExecutionContext,
-    config: PIWebAPIConfig
+    pi_webapi_client
 ) -> MaterializeResult:
     """Extract existing data from PI Web API table"""
     
@@ -97,22 +90,14 @@ def existing_pi_data(
     webid_file_path = _get_upstream_file_path(context, "pi_table_webid")
     table_webid = webid_file_path.read_text().strip()
     
-    kerberos_auth = HTTPKerberosAuth(mutual_authentication=DISABLED)
-    headers = {
-        "Host": "egpna-pi-web",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/json",
-    }
-    
-    query_url = f"{config.base_url}/tables/{table_webid}/data"
-    
-    response = requests.get(query_url, auth=kerberos_auth, headers=headers, verify=True)
+    endpoint = f"/tables/{table_webid}/data"
+    response = pi_webapi_client.make_request("GET", endpoint)
     
     if response.status_code not in (200, 207):
         raise ValueError(f"Failed to get table data: {response.status_code}")
     
     table_data = response.json()
-    columns_dict = table_data.get("Columns", {})
+    # columns_dict = table_data.get("Columns", {})
     rows_list = table_data.get("Rows", [])
     
     df_pi = pd.DataFrame(rows_list)
@@ -217,13 +202,25 @@ def new_pi_records(
 )
 def updated_pi_table(
     context: AssetExecutionContext,
-    config: PIWebAPIConfig
+    pi_webapi_client
 ) -> MaterializeResult:
     """Update PI Web API table with new records"""
     
     # Load new records
     new_records_path = _get_upstream_file_path(context, "new_pi_records")
     df_new = pd.read_csv(new_records_path, parse_dates=['PriceStartDate'])
+
+    # Handle empty case explicitly
+    if len(df_new) == 0:
+        context.log.info("No new records to add to PI Web API - table is already up to date")
+        return MaterializeResult(
+            metadata={
+                "records_added": 0,
+                "update_status": "No updates needed - table current",
+                "action_taken": "Skipped update operation"
+            }
+        )
+    
     
     if len(df_new) == 0:
         context.log.info("No new records to add to PI Web API")
@@ -239,7 +236,7 @@ def updated_pi_table(
     table_webid = webid_file_path.read_text().strip()
     
     # Update PI Web API table
-    success = _update_pi_table(table_webid, df_new, config, context)
+    success = _update_pi_table(table_webid, df_new, pi_webapi_client, context)
     
     if success:
         context.log.info(f"Successfully added {len(df_new)} records to PI Web API")
@@ -293,21 +290,21 @@ def _filter_price_changes(df_new, df_pi, context, price_tolerance=0.001):
     return filtered
 
 
-def _update_pi_table(table_webid, df_new, config, context):
+def _update_pi_table(table_webid, df_new, pi_webapi_client, context):
     """Update PI Web API table with new records"""
     
-    kerberos_auth = HTTPKerberosAuth(mutual_authentication=DISABLED)
-    headers = {
-        "Host": "egpna-pi-web",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/json",
-    }
-    
-    query_url = f"{config.base_url}/tables/{table_webid}/data"
+    # kerberos_auth = HTTPKerberosAuth(mutual_authentication=DISABLED)
+    # headers = {
+    #     "Host": "egpna-pi-web",
+    #     "X-Requested-With": "XMLHttpRequest",
+    #     "Content-Type": "application/json",
+    # }
+    endpoint = f"/tables/{table_webid}/data"
+    # query_url = f"{config.base_url}/tables/{table_webid}/data"
     
     try:
         # Get current table data
-        response = requests.get(query_url, auth=kerberos_auth, headers=headers, verify=True)
+        response = pi_webapi_client.make_request("GET", endpoint)
         
         if response.status_code not in (200, 207):
             context.log.error(f"Failed to get current table data: {response.status_code}")
@@ -335,13 +332,7 @@ def _update_pi_table(table_webid, df_new, config, context):
             "Rows": current_rows + new_rows_list
         }
         
-        update_response = requests.put(
-            query_url,
-            auth=kerberos_auth,
-            headers=headers,
-            json=updated_data,
-            verify=True
-        )
+        update_response = pi_webapi_client.make_request("PUT", endpoint, json=updated_data)
         
         if update_response.status_code in (200, 204, 207):
             context.log.info(f"Successfully updated PI Web API table")
