@@ -6,6 +6,7 @@ from pathlib import Path
 import datetime as dt
 from dagster import asset, AssetExecutionContext, Config, MaterializeResult, MetadataValue
 from typing import Optional
+from ay_test_project.resources.pi_webapi_resource import PIWebAPIResource
 
 
 class PIWebAPIConfig(Config):
@@ -40,7 +41,7 @@ def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: 
 def pi_table_webid(
     context: AssetExecutionContext,
     config: PIWebAPIConfig,
-    pi_webapi_client
+    pi_webapi_client: PIWebAPIResource
     ) -> MaterializeResult:
     """Find and return the WebID for the PI Web API table"""
     
@@ -82,7 +83,7 @@ def pi_table_webid(
 )
 def existing_pi_data(
     context: AssetExecutionContext,
-    pi_webapi_client
+    pi_webapi_client: PIWebAPIResource
 ) -> MaterializeResult:
     """Extract existing data from PI Web API table"""
     
@@ -202,7 +203,7 @@ def new_pi_records(
 )
 def updated_pi_table(
     context: AssetExecutionContext,
-    pi_webapi_client
+    pi_webapi_client: PIWebAPIResource
 ) -> MaterializeResult:
     """Update PI Web API table with new records"""
     
@@ -290,7 +291,7 @@ def _filter_price_changes(df_new, df_pi, context, price_tolerance=0.001):
     return filtered
 
 
-def _update_pi_table(table_webid, df_new, pi_webapi_client, context):
+def _update_pi_table(table_webid, df_new, pi_webapi_client: PIWebAPIResource, context):
     """Update PI Web API table with new records"""
     
     # kerberos_auth = HTTPKerberosAuth(mutual_authentication=DISABLED)

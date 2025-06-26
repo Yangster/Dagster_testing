@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 from dagster import asset, AssetExecutionContext, Config, MaterializeResult, MetadataValue
+from ay_test_project.resources.smartsheet_resource import SmartsheetResource
 # from typing import Optional
 
 
@@ -56,7 +57,7 @@ def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: 
 def raw_smartsheet_data(
     context: AssetExecutionContext, 
     config: SmartsheetConfig,
-    smartsheet_client
+    smartsheet_client: SmartsheetResource
 ) -> MaterializeResult:
     """
     Extract raw economic curtailment threshold data from Smartsheet and save to CSV.
