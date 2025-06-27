@@ -21,34 +21,34 @@ class DataConfig(Config):
     data_dir: str = "data"  # Directory to store CSV files
 
 
-def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: str) -> Path:
-    """
-    Get the file path from upstream asset's metadata.
+# def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: str) -> Path:
+#     """
+#     Get the file path from upstream asset's metadata.
     
-    Args:
-        context: The current asset execution context
-        upstream_asset_key: The key of the upstream asset (e.g., "raw_smartsheet_data")
+#     Args:
+#         context: The current asset execution context
+#         upstream_asset_key: The key of the upstream asset (e.g., "raw_smartsheet_data")
     
-    Returns:
-        Path to the file created by the upstream asset
-    """
-    # Get the materialization record for the upstream asset
-    from dagster import AssetKey
+#     Returns:
+#         Path to the file created by the upstream asset
+#     """
+#     # Get the materialization record for the upstream asset
+#     from dagster import AssetKey
     
-    upstream_key = AssetKey([upstream_asset_key])
-    materialization = context.instance.get_latest_materialization_event(upstream_key)
+#     upstream_key = AssetKey([upstream_asset_key])
+#     materialization = context.instance.get_latest_materialization_event(upstream_key)
     
-    if not materialization:
-        raise ValueError(f"No materialization found for upstream asset: {upstream_asset_key}")
+#     if not materialization:
+#         raise ValueError(f"No materialization found for upstream asset: {upstream_asset_key}")
     
-    # Extract file path from metadata
-    metadata = materialization.dagster_event.event_specific_data.materialization.metadata
+#     # Extract file path from metadata
+#     metadata = materialization.dagster_event.event_specific_data.materialization.metadata
     
-    if "file_path" in metadata:
-        file_path = metadata["file_path"].value
-        return Path(file_path)
-    else:
-        raise ValueError(f"No file_path found in metadata for asset: {upstream_asset_key}")
+#     if "file_path" in metadata:
+#         file_path = metadata["file_path"].value
+#         return Path(file_path)
+#     else:
+#         raise ValueError(f"No file_path found in metadata for asset: {upstream_asset_key}")
     
 def _get_upstream_table_name(context: AssetExecutionContext, upstream_asset_key: str) -> Path:
     """
@@ -150,7 +150,13 @@ def raw_smartsheet_data(
     # df_raw.to_csv(filepath, index=False)
     tbl_name='raw_economic_curtailment'
     with database.get_connection() as conn:
-        conn.execute(f"CREATE OR REPLACE TABLE {tbl_schema}.{tbl_name} AS SELECT * from df_raw")
+        # Create schema if it doesn't exist
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {tbl_schema}")
+        context.log.info(f"Created/verified schema: {tbl_schema}")
+        
+        # Create table
+        conn.execute(f"CREATE OR REPLACE TABLE {tbl_schema}.{tbl_name} AS SELECT * FROM df_raw")
+        context.log.info(f"Created table: {tbl_schema}.{tbl_name}")
     
     context.log.info(f"Saved raw data to {tbl_name} in duckdb")
     
@@ -163,7 +169,7 @@ def raw_smartsheet_data(
             "num_records": len(df_raw),
             "num_columns": len(df_raw.columns),
             "table_name": str(tbl_name),
-            "database_path": database.database_path,
+            # "database_path": database.database_path,
             "latest_update": timestamp,
             # "latest_file_path": str(latest_filepath),
             # "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
@@ -235,7 +241,7 @@ def cleaned_smartsheet_data(
             "num_records": len(df_cleaned),
             "num_columns": len(df_cleaned.columns),
             "table_name": str(clean_tbl_name),
-            "database_path": database.database_path,
+            # "database_path": database.database_path,
             "latest_update": timestamp,
             # "latest_file_path": str(latest_filepath),
             # "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
@@ -298,7 +304,7 @@ def transformed_curtailment_data(
             "num_records": len(df_transformed),
             "num_columns": len(df_transformed.columns),
             "table_name": str(output_tbl_name),
-            "database_path": database.database_path,
+            # "database_path": database.database_path,
             "latest_update": timestamp,
             # "latest_file_path": str(latest_filepath),
             # "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
@@ -388,7 +394,7 @@ def processed_curtailment_data(
             "num_records": len(df_final),
             "num_columns": len(df_final.columns),
             "table_name": output_tbl_name,
-            "database_path": database.database_path,
+            # "database_path": database.database_path,
             "latest_update": timestamp,
             # "latest_file_path": str(latest_filepath),
             # "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
