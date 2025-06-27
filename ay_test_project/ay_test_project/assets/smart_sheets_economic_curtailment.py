@@ -6,9 +6,10 @@ import re
 from pathlib import Path
 from dagster import asset, AssetExecutionContext, Config, MaterializeResult, MetadataValue
 from ay_test_project.resources.smartsheet_resource import SmartsheetResource
+from dagster_duckdb import DuckDBResource
 # from typing import Optional
 
-
+tbl_schema='smartsheet'
 class SmartsheetConfig(Config):
     """Configuration for Smartsheet connection"""
     sheet_name: str = "Economic Curtailment Thresholds"
@@ -49,6 +50,35 @@ def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: 
     else:
         raise ValueError(f"No file_path found in metadata for asset: {upstream_asset_key}")
     
+def _get_upstream_table_name(context: AssetExecutionContext, upstream_asset_key: str) -> Path:
+    """
+    Get the table name from upstream asset's metadata.
+    
+    Args:
+        context: The current asset execution context
+        upstream_asset_key: The key of the upstream asset (e.g., "raw_smartsheet_data")
+    
+    Returns:
+        Path to the file created by the upstream asset
+    """
+    # Get the materialization record for the upstream asset
+    from dagster import AssetKey
+    
+    upstream_key = AssetKey([upstream_asset_key])
+    materialization = context.instance.get_latest_materialization_event(upstream_key)
+    
+    if not materialization:
+        raise ValueError(f"No materialization found for upstream asset: {upstream_asset_key}")
+    
+    # Extract file path from metadata
+    metadata = materialization.dagster_event.event_specific_data.materialization.metadata
+    
+    if "table_name" in metadata:
+        table_name = metadata["table_name"].value
+        return table_name
+    else:
+        raise ValueError(f"No table name found in metadata for asset: {upstream_asset_key}")
+    
 
 @asset(
     description="Raw economic curtailment threshold data extracted from Smartsheet",
@@ -57,7 +87,8 @@ def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: 
 def raw_smartsheet_data(
     context: AssetExecutionContext, 
     config: SmartsheetConfig,
-    smartsheet_client: SmartsheetResource
+    smartsheet_client: SmartsheetResource,
+    database : DuckDBResource
 ) -> MaterializeResult:
     """
     Extract raw economic curtailment threshold data from Smartsheet and save to CSV.
@@ -67,39 +98,6 @@ def raw_smartsheet_data(
     """
     context.log.info(f"Starting extraction from sheet: {config.sheet_name}")
     
-    # Get bearer token from environment
-    # should be in resource
-    # bearer = os.environ.get(config.bearer_token_env_var)
-    # if not bearer:
-    #     raise ValueError(f"Environment variable {config.bearer_token_env_var} not found")
-    
-    # # Create Smartsheet client with SSL configuration
-    # import ssl
-    # import urllib3
-    
-    # Multiple approaches to handle SSL issues in corporate environments
-    # try:
-    #     # Approach 1: Update CA bundle path if available
-    #     ca_bundle_path = os.environ.get('REQUESTS_CA_BUNDLE') or os.environ.get('CURL_CA_BUNDLE')
-    #     if ca_bundle_path and os.path.exists(ca_bundle_path):
-    #         context.log.info(f"Using CA bundle: {ca_bundle_path}")
-    #         ss_client = smartsheet.Smartsheet(f"Bearer {bearer}")
-    #     else:
-    #         # Approach 2: Disable SSL warnings and verification for corporate networks
-    #         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            
-    #         # Create client
-    #         ss_client = smartsheet.Smartsheet(f"Bearer {bearer}")
-            
-    #         # Configure session to bypass SSL verification
-    #         if hasattr(ss_client, '_session'):
-    #             ss_client._session.verify = False
-    #             context.log.info("SSL verification disabled for Smartsheet client")
-            
-    # except Exception as ssl_error:
-    #     context.log.warning(f"SSL configuration failed: {ssl_error}")
-    # Fallback: create client normally and hope for the best
-    # make sure wer'e in dagster2 env of other env with openslll 1.1.1
     ss_client = smartsheet_client.get_client()
     
     # Get all sheets and find the target sheet
@@ -143,15 +141,18 @@ def raw_smartsheet_data(
     context.log.info(f"Extracted {len(df_raw)} rows and {len(df_raw.columns)} columns from Smartsheet")
     
     # Create data directory if it doesn't exist
-    data_dir = Path("data")
-    data_dir.mkdir(exist_ok=True)
+    # data_dir = Path("data")
+    # data_dir.mkdir(exist_ok=True)
     
     # Save to CSV with timestamp
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = data_dir / f"raw_smartsheet_data_{timestamp}.csv"
-    df_raw.to_csv(filepath, index=False)
+    # filepath = data_dir / f"raw_smartsheet_data_{timestamp}.csv"
+    # df_raw.to_csv(filepath, index=False)
+    tbl_name='raw_economic_curtailment'
+    with database.get_connection() as conn:
+        conn.execute(f"CREATE OR REPLACE TABLE {tbl_schema}.{tbl_name} AS SELECT * from df_raw")
     
-    context.log.info(f"Saved raw data to {filepath}")
+    context.log.info(f"Saved raw data to {tbl_name} in duckdb")
     
     # Also save as "latest" version for easy access by downstream assets
     # latest_filepath = data_dir / "raw_smartsheet_data_latest.csv"
@@ -161,9 +162,11 @@ def raw_smartsheet_data(
         metadata={
             "num_records": len(df_raw),
             "num_columns": len(df_raw.columns),
-            "file_path": str(filepath),
+            "table_name": str(tbl_name),
+            "database_path": database.database_path,
+            "latest_update": timestamp,
             # "latest_file_path": str(latest_filepath),
-            "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
+            # "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
             "columns": MetadataValue.json(list(df_raw.columns)),
         }
     )
@@ -175,7 +178,8 @@ def raw_smartsheet_data(
     deps=['raw_smartsheet_data']
 )
 def cleaned_smartsheet_data(
-    context: AssetExecutionContext
+    context: AssetExecutionContext,
+    database : DuckDBResource
 ) -> MaterializeResult:
     """
     Clean and standardize the raw Smartsheet data.
@@ -184,13 +188,17 @@ def cleaned_smartsheet_data(
         MaterializeResult with metadata about the cleaned data file
     """
     context.log.info("Starting data cleaning process...")
-    # Get the file path from upstream asset's metadata
-    raw_file_path = _get_upstream_file_path(context, "raw_smartsheet_data")
+    # Get the table name from upstream asset's metadata
+    raw_tbl_name = _get_upstream_table_name(context, "raw_smartsheet_data")
+    raw_tbl_path = tbl_schema+'.'+raw_tbl_name
+    #load into DF from duckdb
+    with database.get_connection() as conn:
+        df_raw=conn.execute(f"SELECT * FROM {raw_tbl_path}").fetch_df()
 
-    # Load the raw data from the CSV file
-    # latest_filepath = Path("data") / "raw_smartsheet_data_latest.csv"
-    df_raw = pd.read_csv(raw_file_path)
-    context.log.info(f"Loaded {len(df_raw)} rows from {raw_file_path}")
+
+    context.log.info(f"Loaded {len(df_raw)} rows from  duckdb: {raw_tbl_path}")
+
+    
     
     df_cleaned = df_raw.copy()
     
@@ -210,25 +218,27 @@ def cleaned_smartsheet_data(
         if old_name in df_raw.columns:
             context.log.info(f"Renamed column '{old_name}' to '{new_name}'")
     
-    # Save cleaned data
-    data_dir = Path("data")
+    # Save cleaned data into duckdb
+    clean_tbl_name = "cleaned_smartsheet_data"
+    clean_tbl_path= tbl_schema+'.'+clean_tbl_name
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = data_dir / f"cleaned_smartsheet_data_{timestamp}.csv"
-    df_cleaned.to_csv(filepath, index=False)
+    # filepath = data_dir / f"cleaned_smartsheet_data_{timestamp}.csv"
+    with database.get_connection() as conn:
+        conn.execute(f"CREATE OR REPLACE TABLE {clean_tbl_path} AS SELECT * FROM df_cleaned")
+
     
-    # Save as latest
-    # latest_filepath = data_dir / "cleaned_smartsheet_data_latest.csv"
-    # df_cleaned.to_csv(latest_filepath, index=False)
-    
-    context.log.info(f"Cleaning completed. Saved to {filepath}")
+    # Saved into duckdb
+    context.log.info(f"Cleaning completed. Saved to {clean_tbl_path}")
     
     return MaterializeResult(
         metadata={
             "num_records": len(df_cleaned),
             "num_columns": len(df_cleaned.columns),
-            "file_path": str(filepath),
+            "table_name": str(clean_tbl_name),
+            "database_path": database.database_path,
+            "latest_update": timestamp,
             # "latest_file_path": str(latest_filepath),
-            "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
+            # "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
             "columns": MetadataValue.json(list(df_cleaned.columns)),
         }
     )
@@ -240,21 +250,26 @@ def cleaned_smartsheet_data(
     deps=['cleaned_smartsheet_data']
 )
 def transformed_curtailment_data(
-    context: AssetExecutionContext
+    context: AssetExecutionContext,
+    database : DuckDBResource
 ) -> MaterializeResult:
     """
     Transform cleaned data from wide format (dates as columns) to long format.
     
     Returns:
-        MaterializeResult with metadata about the transformed data file
+        MaterializeResult with metadata about the transformed data
     """
     context.log.info("Starting data transformation to long format...")
 
-    # Get the file path from upstream asset's metadata
-    cleaned_file_path = _get_upstream_file_path(context, "cleaned_smartsheet_data")
-    context.log.info(f"Loading cleaned data from: {cleaned_file_path}")
-    df_cleaned = pd.read_csv(cleaned_file_path)
-    context.log.info(f"Loaded {len(df_cleaned)} rows from upstream asset")
+    # Get the table name from upstream asset's metadata
+    clean_tbl_name = _get_upstream_table_name(context, "cleaned_smartsheet_data")
+    clean_tbl_path = tbl_schema+'.'+clean_tbl_name
+    #load into DF from duckdb
+    with database.get_connection() as conn:
+        df_cleaned=conn.execute(f"SELECT * FROM {clean_tbl_path}").fetch_df()
+
+
+    context.log.info(f"Loaded {len(df_cleaned)} rows from  duckdb: {clean_tbl_name}")
     
     # Transform to long format
     df_transformed = _unpivot_price_data(df_cleaned, context)
@@ -264,25 +279,29 @@ def transformed_curtailment_data(
         df_transformed['Subplant'] = df_transformed['Subplant'].astype(int)
         context.log.info("Converted Subplant column to integer")
     
-    # Save transformed data
-    data_dir = Path("data")
+     # Save cleaned data into duckdb
+    output_tbl_name = "transformed_smartsheet_data"
+    output_tbl_path= tbl_schema+'.'+output_tbl_name
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = data_dir / f"transformed_curtailment_data_{timestamp}.csv"
-    df_transformed.to_csv(filepath, index=False)
+    # filepath = data_dir / f"cleaned_smartsheet_data_{timestamp}.csv"
+    with database.get_connection() as conn:
+        conn.execute(f"CREATE OR REPLACE TABLE {output_tbl_path} AS SELECT * FROM df_transformed")
     
     # # Save as latest
     # latest_filepath = data_dir / "transformed_curtailment_data_latest.csv"
     # df_transformed.to_csv(latest_filepath, index=False)
     
-    context.log.info(f"Transformation completed. Saved to {filepath}")
+    context.log.info(f"Transformation completed. Saved to duckdb {output_tbl_path}")
     
     return MaterializeResult(
         metadata={
             "num_records": len(df_transformed),
             "num_columns": len(df_transformed.columns),
-            "file_path": str(filepath),
+            "table_name": str(output_tbl_name),
+            "database_path": database.database_path,
+            "latest_update": timestamp,
             # "latest_file_path": str(latest_filepath),
-            "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
+            # "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
             "columns": MetadataValue.json(list(df_transformed.columns)),
             "date_range": f"{df_transformed['PriceStartDate'].min()} to {df_transformed['PriceStartDate'].max()}" if 'PriceStartDate' in df_transformed.columns else "N/A",
         }
@@ -295,7 +314,8 @@ def transformed_curtailment_data(
     deps=['transformed_curtailment_data']
 )
 def processed_curtailment_data(
-    context: AssetExecutionContext
+    context: AssetExecutionContext,
+    database : DuckDBResource
 ) -> MaterializeResult:
     """
     Final processing step to select and organize columns for downstream use.
@@ -305,12 +325,15 @@ def processed_curtailment_data(
     """
     context.log.info("Starting final data processing...")
     
-    # Get the file path from upstream asset's metadata
-    transformed_file_path = _get_upstream_file_path(context, "transformed_curtailment_data")
-    context.log.info(f"Loading transformed data from: {transformed_file_path}")
-    
-    df_transformed = pd.read_csv(transformed_file_path, parse_dates=['PriceStartDate'])
-    context.log.info(f"Loaded {len(df_transformed)} rows from upstream asset")
+    # Get the table name from upstream asset's metadata
+    input_tbl_name = _get_upstream_table_name(context, "transformed_curtailment_data")
+    input_tbl_path = tbl_schema+'.'+input_tbl_name
+    #load into DF from duckdb
+    with database.get_connection() as conn:
+        df_transformed=conn.execute(f"SELECT * FROM {input_tbl_path}").fetch_df()
+
+    context.log.info(f"Loaded {len(df_transformed)} rows from  duckdb: {input_tbl_path}")
+
     
     # Define the final columns we want to keep
     final_columns = [
@@ -339,16 +362,15 @@ def processed_curtailment_data(
         context.log.info(f"Removed {initial_rows - len(df_final)} rows with null prices")
     
     # Save final data
-    data_dir = Path("data")
+
+    output_tbl_name = "processed_smartsheet_data"
+    output_tbl_path= tbl_schema+'.'+output_tbl_name
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = data_dir / f"processed_curtailment_data_{timestamp}.csv"
-    df_final.to_csv(filepath, index=False)
-    
-    # Save as latest
-    # latest_filepath = data_dir / "processed_curtailment_data_latest.csv"
-    # df_final.to_csv(latest_filepath, index=False)
-    
-    context.log.info(f"Final processing completed. Saved to {filepath}")
+    # filepath = data_dir / f"cleaned_smartsheet_data_{timestamp}.csv"
+    with database.get_connection() as conn:
+        conn.execute(f"CREATE OR REPLACE TABLE {output_tbl_path} AS SELECT * FROM df_final")
+
+    context.log.info(f"Final processing completed. Saved to {output_tbl_path}")
     
     # Calculate some summary statistics for metadata
     price_stats = {}
@@ -365,9 +387,11 @@ def processed_curtailment_data(
         metadata={
             "num_records": len(df_final),
             "num_columns": len(df_final.columns),
-            "file_path": str(filepath),
+            "table_name": output_tbl_name,
+            "database_path": database.database_path,
+            "latest_update": timestamp,
             # "latest_file_path": str(latest_filepath),
-            "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
+            # "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
             "columns": MetadataValue.json(list(df_final.columns)),
             "unique_plants": unique_plants,
             **price_stats,

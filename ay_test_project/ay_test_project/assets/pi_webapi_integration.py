@@ -7,6 +7,7 @@ import datetime as dt
 from dagster import asset, AssetExecutionContext, Config, MaterializeResult, MetadataValue
 from typing import Optional
 from ay_test_project.resources.pi_webapi_resource import PIWebAPIResource
+# from dagster_duckdb import DuckDBResource
 
 
 class PIWebAPIConfig(Config):
