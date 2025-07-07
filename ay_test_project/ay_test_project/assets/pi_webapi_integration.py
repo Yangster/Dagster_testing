@@ -4,10 +4,10 @@ import requests
 from requests_kerberos import HTTPKerberosAuth, DISABLED
 from pathlib import Path
 import datetime as dt
-from dagster import asset, AssetExecutionContext, Config, MaterializeResult, MetadataValue
+from dagster import asset, AssetExecutionContext, Config, MaterializeResult, MetadataValue, AssetIn
 from typing import Optional
 from ay_test_project.resources.pi_webapi_resource import PIWebAPIResource
-# from dagster_duckdb import DuckDBResource
+from dagster_duckdb import DuckDBResource
 
 
 class PIWebAPIConfig(Config):
@@ -37,13 +37,14 @@ def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: 
 
 @asset(
     description="PI Web API table WebID for economic curtailment data",
-    group_name="pi_webapi"
+    group_name="pi_webapi",
+    io_manager_key="io_manager"
 )
 def pi_table_webid(
     context: AssetExecutionContext,
     config: PIWebAPIConfig,
     pi_webapi_client: PIWebAPIResource
-    ) -> MaterializeResult:
+    ) -> pd.DataFrame:
     """Find and return the WebID for the PI Web API table"""
     
     endpoint = f"/assetdatabases/{pi_webapi_client.database_webid}/tables"
@@ -59,20 +60,20 @@ def pi_table_webid(
             table_webid = table.get("WebId")
             context.log.info(f"Found table '{config.table_name}' with WebID: {table_webid}")
             
-            # Save WebID to file for downstream assets
-            data_dir = Path("data")
-            data_dir.mkdir(exist_ok=True)
+            # Return WebID as a single-row DataFrame
+            df_webid = pd.DataFrame({
+                'table_webid': [table_webid],
+                'table_name': [config.table_name],
+                'retrieved_at': [pd.Timestamp.now()]
+            })
             
-            webid_file = data_dir / "pi_table_webid.txt"
-            webid_file.write_text(table_webid)
+            context.add_output_metadata({
+                "table_webid": table_webid,
+                "table_name": config.table_name,
+                "num_records": len(df_webid)
+            })
             
-            return MaterializeResult(
-                metadata={
-                    "table_webid": table_webid,
-                    "table_name": config.table_name,
-                    "file_path": str(webid_file)
-                }
-            )
+            return df_webid
     
     raise ValueError(f"Table '{config.table_name}' not found")
 
@@ -80,17 +81,18 @@ def pi_table_webid(
 @asset(
     description="Existing economic curtailment data from PI Web API",
     group_name="pi_webapi",
-    deps=['pi_table_webid']
+    ins={"pi_table_webid": AssetIn()},
+    io_manager_key="io_manager"
 )
 def existing_pi_data(
     context: AssetExecutionContext,
-    pi_webapi_client: PIWebAPIResource
-) -> MaterializeResult:
+    pi_webapi_client: PIWebAPIResource,
+    pi_table_webid: pd.DataFrame
+) -> pd.DataFrame:
     """Extract existing data from PI Web API table"""
     
     # Get WebID from upstream asset
-    webid_file_path = _get_upstream_file_path(context, "pi_table_webid")
-    table_webid = webid_file_path.read_text().strip()
+    table_webid = pi_table_webid['table_webid'].iloc[0]
     
     endpoint = f"/tables/{table_webid}/data"
     response = pi_webapi_client.make_request("GET", endpoint)
@@ -103,158 +105,190 @@ def existing_pi_data(
     rows_list = table_data.get("Rows", [])
     
     df_pi = pd.DataFrame(rows_list)
-    df_pi['PriceStartDate'] = pd.to_datetime(df_pi['PriceStartDate'])
-    
-    # Save data
-    data_dir = Path("data")
-    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = data_dir / f"existing_pi_data_{timestamp}.csv"
-    df_pi.to_csv(filepath, index=False)
+    if not df_pi.empty and 'PriceStartDate' in df_pi.columns:
+        df_pi['PriceStartDate'] = pd.to_datetime(df_pi['PriceStartDate'])
     
     context.log.info(f"Retrieved {len(df_pi)} existing records from PI Web API")
     
-    return MaterializeResult(
-        metadata={
-            "num_records": len(df_pi),
-            "num_columns": len(df_pi.columns),
-            "file_path": str(filepath),
-            "file_size_mb": round(filepath.stat().st_size / (1024 * 1024), 2),
-        }
-    )
+    context.add_output_metadata({
+        "num_records": len(df_pi),
+        "num_columns": len(df_pi.columns) if not df_pi.empty else 0,
+        "table_webid": table_webid
+    })
+    
+    return df_pi
+
+
+def smartsheet_data_bridge(
+    context: AssetExecutionContext,
+    database: DuckDBResource
+) -> pd.DataFrame:
+    """Bridge asset to load processed smartsheet data from manual DuckDB storage"""
+    
+    with database.get_connection() as conn:
+        # Read from the smartsheet schema where data is stored manually
+        df = conn.execute("SELECT * FROM smartsheet.processed_smartsheet_data").fetch_df()
+    
+    context.log.info(f"Loaded {len(df)} records from smartsheet DuckDB for PI Web API processing")
+    
+    # Ensure PriceStartDate is datetime
+    if 'PriceStartDate' in df.columns:
+        df['PriceStartDate'] = pd.to_datetime(df['PriceStartDate'])
+    
+    context.add_output_metadata({
+        "num_records": len(df),
+        "num_columns": len(df.columns),
+        "source_table": "smartsheet.processed_smartsheet_data"
+    })
+    
+    return df
 
 
 @asset(
     description="New records identified for PI Web API update",
     group_name="pi_webapi",
-    deps=['processed_curtailment_data', 'existing_pi_data']
+    ins={
+        "smartsheet_data_bridge": AssetIn(),
+        "existing_pi_data": AssetIn()
+    },
+    io_manager_key="io_manager"
 )
 def new_pi_records(
-    context: AssetExecutionContext
-) -> MaterializeResult:
+    context: AssetExecutionContext,
+    smartsheet_data_bridge: pd.DataFrame,
+    existing_pi_data: pd.DataFrame
+) -> pd.DataFrame:
     """Identify new records that need to be added to PI Web API"""
     
-    # Load processed Smartsheet data
-    ss_file_path = _get_upstream_file_path(context, "processed_curtailment_data")
-    df_ss = pd.read_csv(ss_file_path, parse_dates=['PriceStartDate'])
+    # Load processed Smartsheet data via bridge asset
+    df_ss = smartsheet_data_bridge.copy()
+    if 'PriceStartDate' in df_ss.columns:
+        df_ss['PriceStartDate'] = pd.to_datetime(df_ss['PriceStartDate'])
     
     # Load existing PI data
-    pi_file_path = _get_upstream_file_path(context, "existing_pi_data")
-    df_pi = pd.read_csv(pi_file_path, parse_dates=['PriceStartDate'])
+    df_pi = existing_pi_data.copy()
     
     # Merge to find new records
-    df_merged = pd.merge(
-        df_ss, df_pi,
-        on=['GlobalPlantcode', 'Subplant', 'PriceStartDate'],
-        indicator=True, how='left'
-    )
-    
-    # Get candidates for new records
-    df_new_candidates = df_merged[df_merged['_merge'] != 'both'].copy()
-    df_new_candidates = df_new_candidates[['GlobalPlantcode', 'Subplant', 'PriceStartDate', 'EconomicThresholdPrice_x']]
-    df_new_candidates = df_new_candidates.rename(columns={'EconomicThresholdPrice_x': 'EconomicThresholdPrice'})
-    
-    # Filter for meaningful price changes
-    df_new = _filter_price_changes(df_new_candidates, df_pi, context)
+    if df_pi.empty:
+        # If no existing data, all Smartsheet data is new
+        df_new = df_ss.copy()
+        context.log.info(f"No existing PI data found. All {len(df_new)} records are new.")
+    else:
+        # Merge to find new records
+        df_merged = pd.merge(
+            df_ss, df_pi,
+            on=['GlobalPlantcode', 'Subplant', 'PriceStartDate'],
+            indicator=True, how='left'
+        )
+        
+        # Get candidates for new records
+        df_new_candidates = df_merged[df_merged['_merge'] != 'both'].copy()
+        if not df_new_candidates.empty:
+            df_new_candidates = df_new_candidates[['GlobalPlantcode', 'Subplant', 'PriceStartDate', 'EconomicThresholdPrice_x']]
+            df_new_candidates = df_new_candidates.rename(columns={'EconomicThresholdPrice_x': 'EconomicThresholdPrice'})
+        else:
+            df_new_candidates = pd.DataFrame(columns=['GlobalPlantcode', 'Subplant', 'PriceStartDate', 'EconomicThresholdPrice'])
+        
+        # Filter for meaningful price changes
+        df_new = _filter_price_changes(df_new_candidates, df_pi, context)
     
     if len(df_new) > 0:
-        # Add reference data
-        df_references = df_pi[['ElementCode', 'PlantName', 'GlobalPlantcode', 'PlantCode', 'Subplant']] \
-                       .drop_duplicates().reset_index(drop=True)
-        
-        df_final = pd.merge(df_new, df_references, on=['GlobalPlantcode', 'Subplant'], how='left')
-        df_final = df_final[['ElementCode', 'PlantName', 'GlobalPlantcode', 'PlantCode', 
-                           'Subplant', 'PriceStartDate', 'EconomicThresholdPrice']]
-        
-        # Save new records
-        data_dir = Path("data")
-        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = data_dir / f"new_pi_records_{timestamp}.csv"
-        df_final.to_csv(filepath, index=False)
+        # Add reference data if we have existing PI data
+        if not df_pi.empty and all(col in df_pi.columns for col in ['ElementCode', 'PlantName', 'PlantCode']):
+            df_references = df_pi[['ElementCode', 'PlantName', 'GlobalPlantcode', 'PlantCode', 'Subplant']] \
+                           .drop_duplicates().reset_index(drop=True)
+            
+            df_final = pd.merge(df_new, df_references, on=['GlobalPlantcode', 'Subplant'], how='left')
+            df_final = df_final[['ElementCode', 'PlantName', 'GlobalPlantcode', 'PlantCode', 
+                               'Subplant', 'PriceStartDate', 'EconomicThresholdPrice']]
+        else:
+            # If no reference data available, use what we have
+            df_final = df_new.copy()
         
         context.log.info(f"Identified {len(df_final)} new records for PI Web API")
         
-        return MaterializeResult(
-            metadata={
-                "num_new_records": len(df_final),
-                "file_path": str(filepath),
-                "price_range": f"${df_final['EconomicThresholdPrice'].min():.2f} - ${df_final['EconomicThresholdPrice'].max():.2f}",
-            }
-        )
+        context.add_output_metadata({
+            "num_new_records": len(df_final),
+            "price_range": f"${df_final['EconomicThresholdPrice'].min():.2f} - ${df_final['EconomicThresholdPrice'].max():.2f}" if 'EconomicThresholdPrice' in df_final.columns else "N/A",
+        })
+        
+        return df_final
     else:
-        # Create empty file for consistency
-        data_dir = Path("data")
-        timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = data_dir / f"new_pi_records_{timestamp}.csv"
-        pd.DataFrame().to_csv(filepath, index=False)
+        # Return empty DataFrame with expected columns
+        empty_columns = ['GlobalPlantcode', 'Subplant', 'PriceStartDate', 'EconomicThresholdPrice']
+        df_empty = pd.DataFrame(columns=empty_columns)
         
         context.log.info("No new records identified")
         
-        return MaterializeResult(
-            metadata={
-                "num_new_records": 0,
-                "file_path": str(filepath),
-            }
-        )
+        context.add_output_metadata({
+            "num_new_records": 0,
+        })
+        
+        return df_empty
 
 
 @asset(
     description="PI Web API table updated with new records",
     group_name="pi_webapi",
-    deps=['new_pi_records', 'pi_table_webid', 'existing_pi_data']
+    ins={
+        "new_pi_records": AssetIn(),
+        "pi_table_webid": AssetIn(),
+        "existing_pi_data": AssetIn()
+    },
+    io_manager_key="io_manager"
 )
 def updated_pi_table(
     context: AssetExecutionContext,
-    pi_webapi_client: PIWebAPIResource
-) -> MaterializeResult:
+    pi_webapi_client: PIWebAPIResource,
+    new_pi_records: pd.DataFrame,
+    pi_table_webid: pd.DataFrame,
+    existing_pi_data: pd.DataFrame
+) -> pd.DataFrame:
     """Update PI Web API table with new records"""
     
-    # Load new records
-    new_records_path = _get_upstream_file_path(context, "new_pi_records")
-    df_new = pd.read_csv(new_records_path, parse_dates=['PriceStartDate'])
-
-    # Handle empty case explicitly
-    if len(df_new) == 0:
+     # Handle empty case explicitly
+    if len(new_pi_records) == 0:
         context.log.info("No new records to add to PI Web API - table is already up to date")
-        return MaterializeResult(
-            metadata={
-                "records_added": 0,
-                "update_status": "No updates needed - table current",
-                "action_taken": "Skipped update operation"
-            }
-        )
-    
-    
-    if len(df_new) == 0:
-        context.log.info("No new records to add to PI Web API")
-        return MaterializeResult(
-            metadata={
-                "records_added": 0,
-                "update_status": "No updates needed"
-            }
-        )
+        context.add_output_metadata({
+            "records_added": 0,
+            "update_status": "No updates needed - table current",
+            "action_taken": "Skipped update operation"
+        })
+        return existing_pi_data.copy()
     
     # Get WebID
-    webid_file_path = _get_upstream_file_path(context, "pi_table_webid")
-    table_webid = webid_file_path.read_text().strip()
-    
+
+    table_webid = pi_table_webid['table_webid'].iloc[0]
+
     # Update PI Web API table
-    success = _update_pi_table(table_webid, df_new, pi_webapi_client, context)
+    success = _update_pi_table(table_webid, new_pi_records, pi_webapi_client, context)
     
     if success:
-        context.log.info(f"Successfully added {len(df_new)} records to PI Web API")
-        return MaterializeResult(
-            metadata={
-                "records_added": len(df_new),
-                "update_status": "Success",
-                "table_webid": table_webid
-            }
-        )
+        context.log.info(f"Successfully added {len(new_pi_records)} records to PI Web API")
+        
+        # Return updated dataset (combine existing + new)
+        if not existing_pi_data.empty:
+            updated_data = pd.concat([existing_pi_data, new_pi_records], ignore_index=True)
+        else:
+            updated_data = new_pi_records.copy()
+        
+        context.add_output_metadata({
+            "records_added": len(new_pi_records),
+            "total_records": len(updated_data),
+            "update_status": "Success",
+            "table_webid": table_webid
+        })
+        
+        return updated_data
     else:
         raise ValueError("Failed to update PI Web API table")
 
 
 def _filter_price_changes(df_new, df_pi, context, price_tolerance=0.001):
     """Filter records for meaningful price changes"""
+
+    if df_new.empty or df_pi.empty:
+        return df_new
     
     # Get latest prices by plant/subplant
     df_pi_sorted = df_pi.sort_values(['GlobalPlantcode', 'Subplant', 'PriceStartDate'])
