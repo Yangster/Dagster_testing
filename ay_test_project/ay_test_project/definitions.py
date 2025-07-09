@@ -12,8 +12,8 @@ pi_webapi_assets = dg.load_assets_from_modules([pi_webapi_integration])
 
 # Configure the IO manager for PI Web API assets
 pi_webapi_io_manager = DuckDBPandasIOManager(
-    database="data/staging/pi_webapi.duckdb",
-    schema="pi_webapi"
+    database="data/staging/data.duckdb",
+    schema="pi_data"
 )
 
 # Configure separate IO manager for smartsheet assets if needed in the future

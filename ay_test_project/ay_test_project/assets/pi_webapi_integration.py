@@ -118,7 +118,12 @@ def existing_pi_data(
     
     return df_pi
 
-
+@asset(
+    description="Bridge asset to load smartsheet data for PI Web API processing",
+    group_name="pi_webapi",
+    deps=["processed_curtailment_data"],
+    io_manager_key="io_manager"
+)
 def smartsheet_data_bridge(
     context: AssetExecutionContext,
     database: DuckDBResource
