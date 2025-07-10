@@ -13,7 +13,7 @@ from dagster import (
     asset, 
     AssetExecutionContext, 
     Config, 
-    MaterializeResult, 
+    # MaterializeResult, 
     MetadataValue,
     AssetIn
 )
@@ -21,14 +21,15 @@ from dagster_duckdb import DuckDBResource
 from ay_test_project.resources.pi_webapi_resource import PIWebAPIResource
 from urllib.parse import urlencode
 import requests
-
+from requests_kerberos import HTTPKerberosAuth, DISABLED
 
 class TurbineDataConfig(Config):
     """Configuration for turbine data extraction"""
-    years: List[int] = [2023, 2024]
+    #do just July-September 2024 for test purposes
+    years: List[int] = [ 2024] 
     months_by_year: Dict[int, List[int]] = {
-        2023: list(range(7, 13)),  # July to December
-        2024: list(range(1, 7))    # January to June
+        # 2023: list(range(7, 13)),  # July to December
+        2024: list(range(7, 10))    # January to June
     }
     batch_size: int = 100  # WebID batch size
     chunk_size: int = 9    # File processing chunk size
@@ -101,9 +102,15 @@ def turbine_webids(
     """
     unique_tags = turbine_tag_config['tag'].unique()
     context.log.info(f"Getting WebIDs for {len(unique_tags)} unique tags")
+    kerberos_auth = HTTPKerberosAuth(mutual_authentication=DISABLED)
+    headers_request = {
+    "Host": "egpna-pi-web",
+    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/json",
+}
     
-    search_url = "/dataservers/F1DS6tERIppyu0-VNWF27uDzjQQU5EVlJQSURBVEFSQ0hBLkVORUxJTlQuR0xPQkFM/points?"
-    batch_url = "/batch"
+    search_url = "https://egpna-pi-web.enelint.global/piwebapi/dataservers/F1DS6tERIppyu0-VNWF27uDzjQQU5EVlJQSURBVEFSQ0hBLkVORUxJTlQuR0xPQkFM/points?"
+    batch_url = 'https://egpna-pi-web.enelint.global/piwebapi/batch'
     
     all_webids = {}
     
@@ -122,12 +129,13 @@ def turbine_webids(
         }
         
         try:
-            response = pi_webapi_client.make_request(
-                "POST", 
-                batch_url,
-                json=search_batch
-            )
-            
+            response = requests.post(
+            batch_url,
+            auth=kerberos_auth,
+            data=json.dumps(search_batch),
+            headers=headers_request,
+            verify=True
+        )
             if response.status_code not in (200, 207):
                 context.log.error(f"Search batch failed with status: {response.status_code}")
                 continue
