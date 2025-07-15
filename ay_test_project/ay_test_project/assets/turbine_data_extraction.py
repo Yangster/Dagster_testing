@@ -18,10 +18,20 @@ from dagster import (
     AssetIn
 )
 from dagster_duckdb import DuckDBResource
-from ay_test_project.resources.pi_webapi_resource import PIWebAPIResource
+# from ay_test_project.resources.pi_webapi_resource import PIWebAPIResource
 from urllib.parse import urlencode
 import requests
 from requests_kerberos import HTTPKerberosAuth, DISABLED
+
+
+kerberos_auth = HTTPKerberosAuth(mutual_authentication=DISABLED)
+headers_request = {
+    "Host": "egpna-pi-web",
+    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/json",
+}
+search_url = "https://egpna-pi-web.enelint.global/piwebapi/dataservers/F1DS6tERIppyu0-VNWF27uDzjQQU5EVlJQSURBVEFSQ0hBLkVORUxJTlQuR0xPQkFM/points?"
+batch_url = 'https://egpna-pi-web.enelint.global/piwebapi/batch'
 
 class TurbineDataConfig(Config):
     """Configuration for turbine data extraction"""
@@ -92,7 +102,7 @@ def turbine_tag_config(
 def turbine_webids(
     context: AssetExecutionContext,
     config: TurbineDataConfig,
-    pi_webapi_client: PIWebAPIResource,
+    # pi_webapi_client: PIWebAPIResource,
     database: DuckDBResource,
     turbine_tag_config: pd.DataFrame
 ) -> pd.DataFrame:
@@ -102,15 +112,9 @@ def turbine_webids(
     """
     unique_tags = turbine_tag_config['tag'].unique()
     context.log.info(f"Getting WebIDs for {len(unique_tags)} unique tags")
-    kerberos_auth = HTTPKerberosAuth(mutual_authentication=DISABLED)
-    headers_request = {
-    "Host": "egpna-pi-web",
-    "X-Requested-With": "XMLHttpRequest",
-    "Content-Type": "application/json",
-}
     
-    search_url = "https://egpna-pi-web.enelint.global/piwebapi/dataservers/F1DS6tERIppyu0-VNWF27uDzjQQU5EVlJQSURBVEFSQ0hBLkVORUxJTlQuR0xPQkFM/points?"
-    batch_url = 'https://egpna-pi-web.enelint.global/piwebapi/batch'
+    
+    
     
     all_webids = {}
     
@@ -201,7 +205,7 @@ def _process_batch_summary(
     start_time: str, 
     end_time: str, 
     webids_dict: Dict[str, str],
-    pi_webapi_client: PIWebAPIResource,
+    # pi_webapi_client: PIWebAPIResource,
     context: AssetExecutionContext
 ) -> Dict:
     """Process a batch of tags and return summarized data (10-minute intervals)"""
@@ -215,7 +219,7 @@ def _process_batch_summary(
         web_id = webids_dict[tag]
         
         # Use summary endpoint
-        data_url = f"/streams/{web_id}/summary"
+        data_url = f"https://egpna-pi-web.enelint.global/piwebapi/streams/{web_id}/summary"
         query_params = [
             ('startTime', start_time),
             ('endTime', end_time),
@@ -237,7 +241,13 @@ def _process_batch_summary(
         return {}
     
     try:
-        response = pi_webapi_client.make_request("POST", "/batch", json=data_batch)
+        response = requests.post(
+        batch_url,
+        auth=kerberos_auth,
+        data=json.dumps(data_batch),
+        headers=headers_request,
+        verify=True
+    )
         
         if response.status_code not in (200, 207):
             context.log.error(f"Data batch failed with status: {response.status_code}")
@@ -330,7 +340,7 @@ def _process_summary_responses(data_json: Dict, context: AssetExecutionContext) 
 def monthly_turbine_data(
     context: AssetExecutionContext,
     config: TurbineDataConfig,
-    pi_webapi_client: PIWebAPIResource,
+    # pi_webapi_client: PIWebAPIResource,
     database: DuckDBResource,
     turbine_webids: pd.DataFrame
 ) -> pd.DataFrame:
@@ -385,7 +395,8 @@ def monthly_turbine_data(
                             # Get summary data from PI Web API
                             data_json = _process_batch_summary(
                                 chunk_tags, start_time_str, end_time_str,
-                                webids_dict, pi_webapi_client, context
+                                webids_dict, #pi_webapi_client, 
+                                context
                             )
                             
                             if not data_json:
