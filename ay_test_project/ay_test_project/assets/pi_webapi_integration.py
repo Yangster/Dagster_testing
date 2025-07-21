@@ -17,22 +17,22 @@ class PIWebAPIConfig(Config):
     table_name: str = "Economic_Curtailment_Prices_Solar"
 
 
-def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: str) -> Path:
-    """Get file path from upstream asset metadata"""
-    from dagster import AssetKey
+# def _get_upstream_file_path(context: AssetExecutionContext, upstream_asset_key: str) -> Path:
+#     """Get file path from upstream asset metadata"""
+#     from dagster import AssetKey
     
-    upstream_key = AssetKey([upstream_asset_key])
-    materialization = context.instance.get_latest_materialization_event(upstream_key)
+#     upstream_key = AssetKey([upstream_asset_key])
+#     materialization = context.instance.get_latest_materialization_event(upstream_key)
     
-    if not materialization:
-        raise ValueError(f"No materialization found for upstream asset: {upstream_asset_key}")
+#     if not materialization:
+#         raise ValueError(f"No materialization found for upstream asset: {upstream_asset_key}")
     
-    metadata = materialization.dagster_event.event_specific_data.materialization.metadata
+#     metadata = materialization.dagster_event.event_specific_data.materialization.metadata
     
-    if "file_path" in metadata:
-        return Path(metadata["file_path"].value)
-    else:
-        raise ValueError(f"No file_path found in metadata for asset: {upstream_asset_key}")
+#     if "file_path" in metadata:
+#         return Path(metadata["file_path"].value)
+#     else:
+#         raise ValueError(f"No file_path found in metadata for asset: {upstream_asset_key}")
 
 
 @asset(
@@ -122,7 +122,7 @@ def existing_pi_data(
     description="Bridge asset to load smartsheet data for PI Web API processing",
     group_name="pi_webapi",
     deps=["processed_curtailment_data"],
-    io_manager_key="io_manager"
+    io_manager_key="intermediate_io_manager"
 )
 def smartsheet_data_bridge(
     context: AssetExecutionContext,
@@ -156,7 +156,7 @@ def smartsheet_data_bridge(
         "smartsheet_data_bridge": AssetIn(),
         "existing_pi_data": AssetIn()
     },
-    io_manager_key="io_manager"
+    io_manager_key="intermediate_io_manager"
 )
 def new_pi_records(
     context: AssetExecutionContext,
@@ -169,10 +169,13 @@ def new_pi_records(
     df_ss = smartsheet_data_bridge.copy()
     if 'PriceStartDate' in df_ss.columns:
         df_ss['PriceStartDate'] = pd.to_datetime(df_ss['PriceStartDate'])
-    
+    context.log.info("smartsheet table:")
+    context.log.info(df_ss)
     # Load existing PI data
+    context.log.info("existing pi data")
     df_pi = existing_pi_data.copy()
-    
+    context.log.info(df_pi)
+
     # Merge to find new records
     if df_pi.empty:
         # If no existing data, all Smartsheet data is new
@@ -193,9 +196,16 @@ def new_pi_records(
             df_new_candidates = df_new_candidates.rename(columns={'EconomicThresholdPrice_x': 'EconomicThresholdPrice'})
         else:
             df_new_candidates = pd.DataFrame(columns=['GlobalPlantcode', 'Subplant', 'PriceStartDate', 'EconomicThresholdPrice'])
-        
+        context.log.info('New candidates:')
+        context.log.info(df_new_candidates)
         # Filter for meaningful price changes
         df_new = _filter_price_changes(df_new_candidates, df_pi, context)
+        context.log.info('df_new:')
+        context.log.info(df_new)
+
+     # Define consistent column structure - ALWAYS return the same 7 columns
+    expected_columns = ['ElementCode', 'PlantName', 'GlobalPlantcode', 'PlantCode', 
+                       'Subplant', 'PriceStartDate', 'EconomicThresholdPrice']
     
     if len(df_new) > 0:
         # Add reference data if we have existing PI data
@@ -209,6 +219,9 @@ def new_pi_records(
         else:
             # If no reference data available, use what we have
             df_final = df_new.copy()
+            df_final['ElementCode'] = None
+            df_final['PlantName'] = None 
+            df_final['PlantCode'] = None
         
         context.log.info(f"Identified {len(df_final)} new records for PI Web API")
         
@@ -220,8 +233,8 @@ def new_pi_records(
         return df_final
     else:
         # Return empty DataFrame with expected columns
-        empty_columns = ['GlobalPlantcode', 'Subplant', 'PriceStartDate', 'EconomicThresholdPrice']
-        df_empty = pd.DataFrame(columns=empty_columns)
+        # empty_columns = ['GlobalPlantcode', 'Subplant', 'PriceStartDate', 'EconomicThresholdPrice']
+        df_empty = pd.DataFrame(columns=expected_columns)
         
         context.log.info("No new records identified")
         

@@ -17,6 +17,14 @@ pi_webapi_io_manager = DuckDBPandasIOManager(
     schema="pi_data"
 )
 
+# Alternative: Create a separate IO manager for intermediate assets that should be replaced
+intermediate_io_manager = DuckDBPandasIOManager(
+    database="data/staging/pi_webapi.duckdb",
+    schema="staging",
+    store_table_type="replace"  # Always recreate the table
+)
+
+
 # Configure separate IO manager for smartsheet assets if needed in the future
 smartsheet_io_manager = DuckDBPandasIOManager(
     database="data/staging/data.duckdb",  # Same as manual DuckDB
@@ -36,6 +44,7 @@ defs=dg.Definitions(
         "pi_webapi_client": PIWebAPIResource(),
         "database": database_resource,
         "io_manager": pi_webapi_io_manager,  # Default for PI Web API assets
+        "intermediate_io_manager": intermediate_io_manager,  # For intermediate processing
         "smartsheet_io_manager": smartsheet_io_manager,  # Available for future use
         "turbine_io_manager": turbine_io_manager  # For turbine data assets
     }
