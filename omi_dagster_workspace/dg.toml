@@ -1,3 +1,9 @@
 directory_type = "workspace"
 
 [workspace]
+
+[[workspace.projects]]
+path = "projects\\qb_ss_insurance_tracker"
+
+[[workspace.projects]]
+path = "projects\\economic_curtailment_thresholds"
