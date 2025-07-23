@@ -19,7 +19,7 @@ pi_webapi_io_manager = DuckDBPandasIOManager(
 
 # Alternative: Create a separate IO manager for intermediate assets that should be replaced
 intermediate_io_manager = DuckDBPandasIOManager(
-    database="data/staging/pi_webapi.duckdb",
+    database="data/staging/data.duckdb",
     schema="staging",
     store_table_type="replace"  # Always recreate the table
 )
