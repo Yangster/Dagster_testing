@@ -217,3 +217,4 @@ tmp/
 temp/
 ay_test_project/ay_test_project/assets/pi_web2.py
 ay_test_project/ay_test_project/assets/test_webids.py
+.tmp*
