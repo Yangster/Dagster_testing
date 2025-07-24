@@ -12,7 +12,8 @@ setup(
         "requests",
         "requests-kerberos",
         "smartsheet-python-sdk",
-        "pytz"
+        "pytz",
+        "pyqb",  # QuickBase Python client
     ],
     extras_require={"dev": ["dagster-webserver", "pytest"]},
 )
