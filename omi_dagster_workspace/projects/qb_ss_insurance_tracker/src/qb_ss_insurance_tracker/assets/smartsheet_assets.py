@@ -10,7 +10,7 @@ from dagster import asset, AssetExecutionContext, Config, MaterializeResult, Met
 from dagster_duckdb import DuckDBResource
 from qb_ss_insurance_tracker.resources.smartsheet_resource import SmartsheetResource
 from qb_ss_insurance_tracker.resources.config_resource import FieldMappingResource
-from qb_ss_insurance_tracker.utils import get_sheet_column_mapping, extract_claim_row_mapping
+from qb_ss_insurance_tracker.utils import get_sheet_column_mapping, extract_claim_row_mapping, make_json_serializable
 
 class SmartsheetConfig(Config):
     """Configuration for Smartsheet operations"""
@@ -78,7 +78,7 @@ def smartsheet_urls(
         metadata={
             "num_sheets": len(df_urls),
             "table_name": "smartsheet.sheet_urls",
-            "sheets": MetadataValue.json(df_urls.to_dict('records'))
+            "sheets": MetadataValue.json(make_json_serializable(df_urls.to_dict('records')))
         }
     )
 

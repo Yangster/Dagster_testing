@@ -2,6 +2,8 @@
 import datetime
 import time
 import json
+import pandas as pd
+import numpy as np
 from typing import Any, Dict, List, Optional, Callable
 from collections import OrderedDict
 
@@ -17,6 +19,35 @@ def retry_operation(operation: Callable, retries: int = 3, delay: int = 2) -> An
                 wait_time = delay * (2 ** attempt)  # Exponential backoff
                 time.sleep(wait_time)
     return None
+
+def make_json_serializable(obj: Any) -> Any:
+    """Convert pandas/numpy objects to JSON serializable types"""
+    if isinstance(obj, pd.Timestamp):
+        return obj.strftime('%Y-%m-%d %H:%M:%S')
+    elif isinstance(obj, pd.Series):
+        return obj.tolist()
+    elif isinstance(obj, pd.DataFrame):
+        # Convert DataFrame to records with serializable values
+        df_copy = obj.copy()
+        for col in df_copy.columns:
+            if df_copy[col].dtype == 'datetime64[ns]':
+                df_copy[col] = df_copy[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+            elif df_copy[col].dtype == 'object':
+                # Handle mixed object columns
+                df_copy[col] = df_copy[col].astype(str)
+        return df_copy.to_dict('records')
+    elif isinstance(obj, (np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: make_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [make_json_serializable(item) for item in obj]
+    else:
+        return obj
 
 def format_qb_data(field_mapping: List[Dict], outage_tracker_resp: Dict) -> Dict[str, Any]:
     """Format QuickBase data for Smartsheet import"""
