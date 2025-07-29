@@ -1865,6 +1865,7 @@ dependencies = [
     { name = "dagster-duckdb-pandas" },
     { name = "pandas" },
     { name = "pyqb" },
+    { name = "python-dotenv" },
     { name = "smartsheet-python-sdk" },
 ]
 
@@ -1882,6 +1883,7 @@ requires-dist = [
     { name = "dagster-duckdb-pandas", specifier = ">=0.27.2" },
     { name = "pandas", specifier = ">=2.3.1" },
     { name = "pyqb", specifier = ">=0.2.5" },
+    { name = "python-dotenv", specifier = ">=1.1.1" },
     { name = "smartsheet-python-sdk", specifier = ">=3.0.5" },
 ]
 
