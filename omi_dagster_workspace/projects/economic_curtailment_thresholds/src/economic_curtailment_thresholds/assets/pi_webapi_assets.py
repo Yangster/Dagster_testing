@@ -37,7 +37,7 @@ def _get_upstream_table_name(context: AssetExecutionContext, upstream_asset_key:
     description="PI Web API table WebID for economic curtailment data",
     group_name="pi_webapi",
     io_manager_key="io_manager",
-    kind='duckdb'
+    kinds={'duckdb'}
 )
 def pi_table_webid(
     context: AssetExecutionContext,
@@ -82,7 +82,7 @@ def pi_table_webid(
     group_name="pi_webapi",
     ins={"pi_table_webid": AssetIn()},
     io_manager_key="io_manager",
-    kind="duckdb"
+    kinds={"duckdb"}
 )
 def existing_pi_data(
     context: AssetExecutionContext,
@@ -123,7 +123,7 @@ def existing_pi_data(
     group_name="pi_webapi",
     deps=["processed_curtailment_data"],
     io_manager_key="io_manager",
-    kind="duckdb"
+    kinds={"duckdb"}
 )
 def smartsheet_data_bridge(
     context: AssetExecutionContext,
@@ -158,7 +158,7 @@ def smartsheet_data_bridge(
         "existing_pi_data": AssetIn()
     },
     io_manager_key="io_manager",
-    kind="duckdb"
+    kinds={"duckdb"}
 )
 def new_pi_records(
     context: AssetExecutionContext,
