@@ -48,22 +48,22 @@ def qb_field_schema(
         )
         
         if response.status_code != 200:
-            raise ValueError(f"Failed to get QB schema: {response.status_code}")
+            raise ValueError(f"Failed to get QB schema: {response.status_code} - {response.text}")
             
         schema_data = response.json()
         
         # Filter to relevant fields
         relevant_fields = [field for field in schema_data if field['label'] in qb_field_mapping]
         
-        # Create field ID lookup
+        # Create field ID lookup - ENSURE STRING KEYS like the working code
         field_lookup = {'515': "Unit # - Longitude"}  # Special case from original code
         for field in relevant_fields:
-            field_lookup[str(field['id'])] = field['label']
+            field_lookup[str(field['id'])] = field['label']  # Convert to string!
         
         # Create DataFrame for storage
         df_schema = pd.DataFrame([
             {
-                'field_id': fid,
+                'field_id': fid,  # Store as string
                 'field_label': label,
                 'field_type': 'coordinate' if 'Longitude' in label else 'standard',
                 'extracted_at': pd.Timestamp.now()
@@ -185,8 +185,12 @@ def qb_claim_details(
         df_claims = conn.execute("SELECT * FROM quickbase.open_claims").fetch_df()
         df_schema = conn.execute("SELECT * FROM quickbase.field_schema").fetch_df()
     
-    # Create field ID lookup
-    field_lookup = dict(zip(df_schema['field_id'], df_schema['field_label']))
+    # Create field ID lookup - ENSURE STRING KEYS
+    field_lookup = {}
+    for _, row in df_schema.iterrows():
+        field_lookup[str(row['field_id'])] = row['field_label']  # Ensure string keys
+    
+    context.log.info(f"Field lookup created with {len(field_lookup)} fields: {list(field_lookup.keys())[:5]}...")
     
     # Get field mapping
     mapping = field_mapping.load_field_mapping()
@@ -257,12 +261,15 @@ def _query_single_claim(claim_id: str, quickbase_client: QuickBaseResource, fiel
     """Query a single claim from QuickBase with retry logic"""
     
     def query_operation():
-        query_string = f"'{{'Record ID#'.EX.'{claim_id}'}}"
+        # FIX: Use the same query format as the working code
+        query_string = "{'Record ID#'.EX.'" + claim_id + "'}"  # Remove extra quotes!
         query_body = {
             "from": OUTAGE_TABLE,
             "where": query_string,
             "select": list(field_lookup.keys())
         }
+        
+        context.log.debug(f"Query body for claim #{claim_id}: {query_body}")
         
         response = quickbase_client.make_request(
             'POST', 
@@ -272,6 +279,7 @@ def _query_single_claim(claim_id: str, quickbase_client: QuickBaseResource, fiel
         )
         
         if response.status_code != 200:
+            context.log.error(f"QB API returned {response.status_code} for claim #{claim_id}: {response.text}")
             raise ValueError(f"QB API returned {response.status_code}")
         
         return response.json()['data']
