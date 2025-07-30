@@ -437,14 +437,53 @@ def claims_for_processing(
             add_claim['operation'] = 'add'
             add_claims.append(add_claim)
     
-    # Create DataFrames
-    df_updates = pd.DataFrame(update_claims) if update_claims else pd.DataFrame()
-    df_adds = pd.DataFrame(add_claims) if add_claims else pd.DataFrame()
+    # Create DataFrames with proper handling for empty cases
+    if update_claims:
+        df_updates = pd.DataFrame(update_claims)
+    else:
+        # Create empty DataFrame with expected columns from a sample QB claim
+        if not qb_claims_active.empty:
+            sample_columns = list(qb_claims_active.columns) + ['sheet_row_id', 'operation']
+        else:
+            # Fallback columns if no QB claims available
+            sample_columns = [
+                'claim_id', 'extracted_at', 'source', 'sheet_row_id', 'operation',
+                'Record # in Outage Management (QB)*', 'Site Name (QB)*', 'Technology (QB)*'
+            ]
+        df_updates = pd.DataFrame(columns=sample_columns)
     
-    # Store in DuckDB
+    if add_claims:
+        df_adds = pd.DataFrame(add_claims)
+    else:
+        # Create empty DataFrame with expected columns from a sample QB claim
+        if not qb_claims_active.empty:
+            sample_columns = list(qb_claims_active.columns) + ['operation']
+        else:
+            # Fallback columns if no QB claims available
+            sample_columns = [
+                'claim_id', 'extracted_at', 'source', 'operation',
+                'Record # in Outage Management (QB)*', 'Site Name (QB)*', 'Technology (QB)*'
+            ]
+        df_adds = pd.DataFrame(columns=sample_columns)
+    
+    # Store in DuckDB with proper table creation
     with database.get_connection() as conn:
-        conn.execute("CREATE OR REPLACE TABLE smartsheet.claims_for_update AS SELECT * FROM df_updates")
-        conn.execute("CREATE OR REPLACE TABLE smartsheet.claims_for_add AS SELECT * FROM df_adds")
+        # Create tables with proper column definitions
+        if not df_updates.empty:
+            conn.execute("CREATE OR REPLACE TABLE smartsheet.claims_for_update AS SELECT * FROM df_updates")
+        else:
+            # Create empty table with proper schema
+            context.log.info("Creating empty claims_for_update table with schema")
+            columns_sql = ", ".join([f'"{col}" VARCHAR' for col in df_updates.columns])
+            conn.execute(f"CREATE OR REPLACE TABLE smartsheet.claims_for_update ({columns_sql})")
+        
+        if not df_adds.empty:
+            conn.execute("CREATE OR REPLACE TABLE smartsheet.claims_for_add AS SELECT * FROM df_adds")
+        else:
+            # Create empty table with proper schema
+            context.log.info("Creating empty claims_for_add table with schema")
+            columns_sql = ", ".join([f'"{col}" VARCHAR' for col in df_adds.columns])
+            conn.execute(f"CREATE OR REPLACE TABLE smartsheet.claims_for_add ({columns_sql})")
     
     context.log.info(f"Categorized claims: {len(df_updates)} for update, {len(df_adds)} for addition")
     
@@ -751,15 +790,37 @@ def processing_summary(
     
     # Load all results
     with database.get_connection() as conn:
-        df_updates = conn.execute("SELECT * FROM smartsheet.batch_update_results").fetch_df()
-        df_adds = conn.execute("SELECT * FROM smartsheet.batch_add_results").fetch_df()
-        df_subtasks = conn.execute("SELECT * FROM smartsheet.subtask_creation_results").fetch_df()
+        # Check if tables exist and load data
+        try:
+            df_updates = conn.execute("SELECT * FROM smartsheet.batch_update_results").fetch_df()
+        except Exception as e:
+            context.log.warning(f"No batch_update_results table found: {e}")
+            df_updates = pd.DataFrame()
+            
+        try:
+            df_adds = conn.execute("SELECT * FROM smartsheet.batch_add_results").fetch_df()
+        except Exception as e:
+            context.log.warning(f"No batch_add_results table found: {e}")
+            df_adds = pd.DataFrame()
+            
+        try:
+            df_subtasks = conn.execute("SELECT * FROM smartsheet.subtask_creation_results").fetch_df()
+        except Exception as e:
+            context.log.warning(f"No subtask_creation_results table found: {e}")
+            df_subtasks = pd.DataFrame()
         
         # Get total counts from source data
-        total_qb_claims = conn.execute("SELECT COUNT(*) as count FROM quickbase.claim_details").fetch_df().iloc[0]['count']
-        total_archived = conn.execute("SELECT COUNT(*) as count FROM smartsheet.archived_claims").fetch_df().iloc[0]['count']
+        try:
+            total_qb_claims = conn.execute("SELECT COUNT(*) as count FROM quickbase.claim_details").fetch_df().iloc[0]['count']
+        except Exception:
+            total_qb_claims = 0
+            
+        try:
+            total_archived = conn.execute("SELECT COUNT(*) as count FROM smartsheet.archived_claims").fetch_df().iloc[0]['count']
+        except Exception:
+            total_archived = 0
     
-    # Calculate summary metrics
+    # Calculate summary metrics with safe handling for empty DataFrames
     summary = {
         'processing_date': pd.Timestamp.now(),
         'total_qb_claims': int(total_qb_claims),
@@ -774,20 +835,28 @@ def processing_summary(
         'parents_with_subtasks': len(df_subtasks[df_subtasks['status'] == 'success']) if not df_subtasks.empty else 0,
     }
     
-    # Calculate performance metrics
-    if not df_updates.empty:
+    # Calculate performance metrics with safe handling
+    if not df_updates.empty and 'batch_id' in df_updates.columns:
         update_batches = df_updates['batch_id'].nunique()
         summary['update_batches_processed'] = update_batches
+    else:
+        summary['update_batches_processed'] = 0
     
-    if not df_adds.empty:
+    if not df_adds.empty and 'batch_id' in df_adds.columns:
         add_batches = df_adds['batch_id'].nunique()
         summary['add_batches_processed'] = add_batches
+    else:
+        summary['add_batches_processed'] = 0
     
     # Create summary DataFrame
     df_summary = pd.DataFrame([summary])
     
-    # Store summary
+    # Store summary with schema creation
     with database.get_connection() as conn:
+        # Create reporting schema if it doesn't exist
+        conn.execute("CREATE SCHEMA IF NOT EXISTS reporting")
+        
+        # Store the summary
         conn.execute("CREATE OR REPLACE TABLE reporting.processing_summary AS SELECT * FROM df_summary")
     
     # Log summary
@@ -799,11 +868,10 @@ def processing_summary(
     
     return MaterializeResult(
         metadata={
-            **summary,
+            **{k: int(v) if isinstance(v, (int, float)) else str(v) for k, v in summary.items()},
             "table_name": "reporting.processing_summary"
         }
     )
-
 # Helper classes and functions
 
 class SmartsheetBatchProcessor:
