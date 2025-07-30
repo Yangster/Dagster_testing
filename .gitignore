@@ -220,3 +220,4 @@ ay_test_project/ay_test_project/assets/test_webids.py
 #temp dagster dev files
 .tmp*
 omi_dagster_workspace/projects/qb_ss_insurance_tracker/src/qb_ss_insurance_tracker/defs2.py
+omi_dagster_workspace/projects/economic_curtailment_thresholds/test.py
