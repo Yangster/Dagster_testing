@@ -10,5 +10,3 @@ dependencies = [
 
 [tool.dg]
 directory_type = "deployment"
-
-
