@@ -621,7 +621,7 @@ def batch_add_results(
         df_results = pd.DataFrame(columns=['claim_id', 'operation', 'status', 'batch_id', 'new_row_id', 'processed_at'])
     else:
         # Get sheet ID
-        sheet_id = sheet_urls.iloc[0]['sheet_id']
+        sheet_id = sheet_urls[sheet_urls.sheet_type=='main']['sheet_id']
         
         # Create column mapping
         mapping = field_mapping.load_field_mapping()
