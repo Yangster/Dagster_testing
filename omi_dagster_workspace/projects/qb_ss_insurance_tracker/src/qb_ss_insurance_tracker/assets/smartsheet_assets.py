@@ -677,6 +677,7 @@ def batch_add_results(
         }
     )
 
+
 @asset(
     description="Subtasks added to new parent rows",
     group_name="smartsheet_operations",
@@ -688,7 +689,7 @@ def subtask_creation_results(
     smartsheet_client: SmartsheetResource,
     database: DuckDBResource
 ) -> MaterializeResult:
-    """Add subtasks to newly created parent rows"""
+    """Add subtasks to newly created parent rows using fixed logic"""
     
     context.log.info("Adding subtasks to new parent rows...")
     
@@ -718,7 +719,7 @@ def subtask_creation_results(
             # Get sheet URL
             sheet_url = sheet_urls.iloc[0]['sheet_url']
             
-            # Add subtasks
+            # Add subtasks using fixed logic
             ss_client = smartsheet_client.get_client()
             subtask_results = []
             
@@ -726,12 +727,12 @@ def subtask_creation_results(
                 context.log.info(f"Adding subtasks for claim {parent_info['claim_id']}")
                 
                 try:
-                    subtasks_added = _add_subtasks_for_parent(
-                        ss_client, sheet_url, parent_info, df_template, context
+                    subtasks_added = add_subtasks_for_single_parent(
+                        ss_client, sheet_url, parent_info, df_template, database, context
                     )
                     
                     subtask_results.append({
-                        'parent_claim_id': parent_info["Record # in Outage Management (QB)*"],
+                        'parent_claim_id': parent_info['claim_id'],
                         'parent_row_id': parent_info['parent_row_id'],
                         'subtasks_added': subtasks_added,
                         'status': 'success' if subtasks_added > 0 else 'failed',
@@ -741,7 +742,7 @@ def subtask_creation_results(
                 except Exception as e:
                     context.log.error(f"Failed to add subtasks for claim {parent_info['claim_id']}: {e}")
                     subtask_results.append({
-                        'parent_claim_id': parent_info["Record # in Outage Management (QB)*"],
+                        'parent_claim_id': parent_info['claim_id'],
                         'parent_row_id': parent_info['parent_row_id'],
                         'subtasks_added': 0,
                         'status': 'failed',
@@ -1072,9 +1073,91 @@ def _enable_column_formulas(ss_client, sheet_id, formula_jail, context):
     except Exception as e:
         context.log.error(f"Failed to re-enable column formulas: {e}")
 
-def _add_subtasks_for_parent(ss_client, sheet_url, parent_info, df_template, context):
-    """Add subtasks for a single parent row"""
-    # Template indent mapping from original code
+
+def add_subtasks_for_single_parent(ss_client, sheet_url, parent_info, df_template, database, context):
+    """Add subtasks for a single parent row using the working logic from original code"""
+    
+    context.log.info(f"Processing subtasks for parent row ID: {parent_info['parent_row_id']}")
+    
+    # Get main sheet data for column mapping
+    with database.get_connection() as conn:
+        df_columns = conn.execute("SELECT * FROM smartsheet.main_sheet_columns").fetch_df()
+    
+    # Reconstruct sheet_data format for column mapping
+    sheet_data = {
+        'columns': []
+    }
+    
+    for _, col in df_columns.iterrows():
+        sheet_data['columns'].append({
+            'id': col['column_id'],
+            'title': col['column_title']
+        })
+    
+    # Convert template DataFrame to the format expected by get_nested_rows_fixed
+    template_sheet_data = {
+        'rows': [],
+        'columns': []
+    }
+    
+    # Process template data - we need to reconstruct the original format
+    for idx, row in df_template.iterrows():
+        template_row = {'cells': []}
+        
+        # Process each cell column in the row
+        for col_name in row.index:
+            if col_name.startswith('cell_') and pd.notna(row[col_name]):
+                cell_data = row[col_name]
+                
+                # Parse the cell data if it's a string representation of a dict
+                if isinstance(cell_data, str):
+                    try:
+                        # Try to parse if it's a string representation of a dict
+                        import ast
+                        cell_data = ast.literal_eval(cell_data)
+                    except:
+                        continue
+                
+                # Handle the cell data structure
+                if isinstance(cell_data, dict):
+                    cell = {
+                        'columnId': cell_data.get('column_id'),
+                        'value': cell_data.get('value', ''),
+                    }
+                    
+                    # Add hyperlink if present
+                    if cell_data.get('hyperlink'):
+                        cell['hyperlink'] = cell_data['hyperlink']
+                    
+                    # Only add cell if it has a valid column ID
+                    if cell['columnId']:
+                        template_row['cells'].append(cell)
+        
+        template_sheet_data['rows'].append(template_row)
+    
+    # Extract unique columns from template data for the columns list
+    template_columns = set()
+    for row in template_sheet_data['rows']:
+        for cell in row['cells']:
+            template_columns.add(cell['columnId'])
+    
+    template_sheet_data['columns'] = [{'id': col_id, 'title': f'Column_{col_id}'} for col_id in template_columns]
+    
+    # Use the working logic from your original code
+    return add_subtasks_with_grouping_fixed(
+        ss_client, sheet_url, [parent_info], 
+        template_sheet_data, sheet_data, context
+    )
+
+def add_subtasks_with_grouping_fixed(ss_client, sheet_url, parent_rows_info, template_sheet_data, sheet_data, context):
+    """
+    Fixed version based on the working update_sheet.py logic
+    """
+    context.log.info("Adding subtasks with optimized grouping...")
+    
+    # Get nested rows using the same logic as working code
+    template_rows = get_nested_rows_fixed(sheet_data, template_sheet_data)
+    
     template_indent_mapping = {
         1: "1", 2: "2", 3: "1", 4: "2", 5: "2", 6: "2", 7: "2", 8: "2", 
         9: "2", 10: "2", 11: "2", 12: "2", 13: "2", 14: "1", 15: "2", 
@@ -1082,106 +1165,157 @@ def _add_subtasks_for_parent(ss_client, sheet_url, parent_info, df_template, con
     }
     
     successful_additions = 0
-    parent_row_id = parent_info['parent_row_id']
     
-    # Add level 1 rows (phases) first
-    phase_mapping = {}
-    
-    for idx in range(1, len(df_template) + 1):
-        if template_indent_mapping.get(idx) == "1":
-            template_row = df_template.iloc[idx - 1]
-            
-            # Create row data
-            row_data = {
-                "parentId": parent_row_id,
-                "toBottom": True,
-                "cells": _extract_template_cells(template_row)
-            }
-            
-            # Add phase row
-            success, new_row_id = _add_single_row(sheet_url, row_data, context)
-            if success:
-                phase_mapping[idx] = new_row_id
-                successful_additions += 1
-    
-    # Add level 2 rows (tasks)
-    for idx in range(1, len(df_template) + 1):
-        if template_indent_mapping.get(idx) == "2":
-            # Find parent phase
-            parent_phase_idx = None
-            for phase_idx in range(idx - 1, 0, -1):
-                if template_indent_mapping.get(phase_idx) == "1":
-                    parent_phase_idx = phase_idx
-                    break
-            
-            if parent_phase_idx and parent_phase_idx in phase_mapping:
-                template_row = df_template.iloc[idx - 1]
-                parent_phase_id = phase_mapping[parent_phase_idx]
+    for parent_info in parent_rows_info:
+        parent_row_id = parent_info["parent_row_id"]
+        claim_id = parent_info.get("claim_id", "unknown")
+        
+        context.log.info(f"Adding subtasks for claim {claim_id}, parent row ID: {parent_row_id}")
+        
+        # Add level 1 rows (phases) first
+        phase_mapping = {}
+        
+        for idx, template_row in enumerate(template_rows, 1):
+            if template_indent_mapping.get(idx) == "1":
+                row_data = template_row.copy()
+                row_data["parentId"] = parent_row_id
+                row_data["toBottom"] = True
                 
-                # Create row data
-                row_data = {
-                    "parentId": parent_phase_id,
-                    "toBottom": True,
-                    "cells": _extract_template_cells(template_row)
-                }
+                # Add phase row with retry logic
+                success = False
+                for attempt in range(3):
+                    try:
+                        response = add_row_from_json_fixed(sheet_url, row_data, context)
+                        if "result" in response and "id" in response["result"]:
+                            new_row_id = response["result"]["id"]
+                            phase_mapping[idx] = new_row_id
+                            successful_additions += 1
+                            context.log.info(f"Added phase row {idx} with ID: {new_row_id}")
+                            success = True
+                            break
+                    except Exception as e:
+                        context.log.warning(f"Phase row attempt {attempt + 1}/3 failed: {e}")
+                        if attempt < 2:
+                            time.sleep(2)
                 
-                # Add task row
-                success, new_row_id = _add_single_row(sheet_url, row_data, context)
-                if success:
-                    successful_additions += 1
+                if not success:
+                    context.log.error(f"Failed to add phase row {idx} after all retries")
+        
+        # Add level 2 rows (tasks)
+        for idx, template_row in enumerate(template_rows, 1):
+            if template_indent_mapping.get(idx) == "2":
+                # Find parent phase
+                parent_phase_idx = None
+                for phase_idx in range(idx - 1, 0, -1):
+                    if template_indent_mapping.get(phase_idx) == "1":
+                        parent_phase_idx = phase_idx
+                        break
+                
+                if parent_phase_idx and parent_phase_idx in phase_mapping:
+                    parent_phase_id = phase_mapping[parent_phase_idx]
+                    row_data = template_row.copy()
+                    row_data["parentId"] = parent_phase_id
+                    row_data["toBottom"] = True
+                    
+                    # Add task row with retry logic
+                    success = False
+                    for attempt in range(3):
+                        try:
+                            response = add_row_from_json_fixed(sheet_url, row_data, context)
+                            if "result" in response and "id" in response["result"]:
+                                successful_additions += 1
+                                context.log.info(f"Added task row {idx}")
+                                success = True
+                                break
+                        except Exception as e:
+                            context.log.warning(f"Task row attempt {attempt + 1}/3 failed: {e}")
+                            if attempt < 2:
+                                time.sleep(2)
+                    
+                    if not success:
+                        context.log.error(f"Failed to add task row {idx} after all retries")
     
+    context.log.info(f"Subtask addition completed. {successful_additions} rows added successfully.")
     return successful_additions
 
-def _extract_template_cells(template_row):
-    """Extract cell data from template row"""
-    cells = []
+def get_nested_rows_fixed(main_sheet_data, template_sheet_data):
+    """
+    Fixed version based on working update_sheet.py
+    """
+    # used only for matching the title of the column to the destination table
+    template_col_names = [col['title'] for col in template_sheet_data.get('columns', [])]
+    main_sheet_colid_lookup = {}
     
-    # Process all cell columns in the template row
-    for col_name in template_row.index:
-        if col_name.startswith('cell_') and pd.notna(template_row[col_name]):
-            cell_data = template_row[col_name]
-            
-            if isinstance(cell_data, dict):
-                cell = {
-                    'columnId': cell_data.get('column_id'),
-                    'value': cell_data.get('value', '')
-                }
+    # {template col id : destination sheet col id}
+    for template_name in template_col_names:
+        sheet_col_id = None
+        template_col_id = None
+        
+        # Find column IDs
+        for col in main_sheet_data['columns']:
+            if col['title'] == template_name:
+                sheet_col_id = col['id']
+                break
                 
-                # Add hyperlink if present
-                if cell_data.get('hyperlink'):
-                    cell['hyperlink'] = cell_data['hyperlink']
-                
-                cells.append(cell)
-    
-    return cells
+        for col in template_sheet_data.get('columns', []):
+            if col['title'] == template_name:
+                template_col_id = col['id']
+                break
+        
+        if sheet_col_id and template_col_id:
+            main_sheet_colid_lookup[template_col_id] = sheet_col_id
 
-def _add_single_row(sheet_url, row_data, context):
-    """Add a single row to the sheet with retry logic"""
-    row_url = f"{sheet_url}/rows"
+    new_template_rows = []
+    for row in template_sheet_data.get('rows', []):
+        new_row_from_template = {}
+        current_row_cells = []
+        
+        for cell in row.get('cells', []):
+            template_col_id = cell['columnId']
+            dest_col_id = main_sheet_colid_lookup.get(template_col_id)
+            
+            if not dest_col_id:
+                continue
+                
+            value_from_template = cell.get('value', "")
+            hyperlink = cell.get('hyperlink')
+            
+            cell_data = {
+                'columnId': dest_col_id,
+                'value': value_from_template
+            }
+            
+            if hyperlink:
+                cell_data['hyperlink'] = hyperlink
+                
+            current_row_cells.append(cell_data)
+        
+        new_row_from_template["cells"] = current_row_cells
+        new_template_rows.append(new_row_from_template)
     
-    # Get headers (assuming we have access to the smartsheet client)
+    return new_template_rows
+
+def add_row_from_json_fixed(url, row_as_json, context):
+    """
+    Fixed version of add_row_from_json with proper headers and error handling
+    """
     import os
+    
     bearer = os.environ.get("SMARTSHEETS_TOKEN")
     headers = {
         "Authorization": f"Bearer {bearer}",
-        "ContentType": "application/json"
+        "Content-Type": "application/json"  # Fixed: was ContentType
     }
     
-    for attempt in range(3):
-        try:
-            response = requests.post(row_url, headers=headers, json=row_data)
-            
-            if response.status_code in [200, 201]:
-                result = response.json()
-                if "result" in result and "id" in result["result"]:
-                    return True, result["result"]["id"]
-            
-            context.log.warning(f"Add row attempt {attempt + 1}/3 failed: {response.status_code}")
-            
-        except Exception as e:
-            context.log.warning(f"Add row attempt {attempt + 1}/3 failed: {e}")
-        
-        if attempt < 2:
-            time.sleep(2)
+    row_url = url + "/rows"
     
-    return False, None
+    context.log.debug(f"Adding row to {row_url}")
+    context.log.debug(f"Row data: {row_as_json}")
+    
+    response = requests.post(row_url, headers=headers, json=row_as_json, verify=False)
+    
+    if response.status_code not in [200, 201]:
+        context.log.error(f"Add row failed with status {response.status_code}: {response.text}")
+        raise Exception(f"HTTP {response.status_code}: {response.text}")
+    
+    return response.json()
