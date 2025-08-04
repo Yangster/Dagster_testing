@@ -399,7 +399,8 @@ def current_tracked_claims(
 )
 def claims_for_processing(
     context: AssetExecutionContext,
-    database: DuckDBResource
+    database: DuckDBResource,
+    field_mapping: FieldMappingResource
 ) -> MaterializeResult:
     """Categorize claims into those needing updates vs new additions"""
     
@@ -418,53 +419,45 @@ def claims_for_processing(
     # Get currently tracked claim IDs
     tracked_claim_ids = set(df_tracked['claim_id'].astype(str)) if not df_tracked.empty else set()
     
+
+    # ADD: Get field mapping for transformation
+    # mapping = field_mapping.load_field_mapping()
     # Categorize claims
     update_claims = []
     add_claims = []
     
     for _, qb_claim in qb_claims_active.iterrows():
         claim_id = str(qb_claim['claim_id'])
+        # Convert row to dict and apply field mapping
+        qb_dict = qb_claim.to_dict()
+        mapped_dict = field_mapping.map_qb_to_ss(qb_dict)  # QB→SS field names
         
         if claim_id in tracked_claim_ids:
             # Existing claim - needs update
             row_info = df_tracked[df_tracked['claim_id'] == claim_id].iloc[0]
-            update_claim = qb_claim.to_dict()
-            update_claim['sheet_row_id'] = row_info['row_id']
-            update_claim['operation'] = 'update'
-            update_claims.append(update_claim)
+            mapped_dict['sheet_row_id'] = row_info['row_id']
+            mapped_dict['operation'] = 'update'
+            update_claims.append(mapped_dict)
         else:
-            # New claim - needs addition
-            add_claim = qb_claim.to_dict()
-            add_claim['operation'] = 'add'
-            add_claims.append(add_claim)
+            # New claim - needs addition  
+            mapped_dict['operation'] = 'add'
+            add_claims.append(mapped_dict)
     
     # Create DataFrames with proper handling for empty cases
     if update_claims:
         df_updates = pd.DataFrame(update_claims)
     else:
-        # Create empty DataFrame with expected columns from a sample QB claim
-        if not qb_claims_active.empty:
-            sample_columns = list(qb_claims_active.columns) + ['sheet_row_id', 'operation']
-        else:
-            # Fallback columns if no QB claims available
-            sample_columns = [
-                'claim_id', 'extracted_at', 'source', 'sheet_row_id', 'operation',
-                'Record # in Outage Management (QB)*', 'Site Name (QB)*', 'Technology (QB)*'
-            ]
+        # Create empty DataFrame with Smartsheet field names
+        sample_ss_fields = [f['ss_field'] for f in field_mapping.load_field_mapping()]
+        sample_columns = sample_ss_fields + ['sheet_row_id', 'operation', 'claim_id', 'extracted_at', 'source']
         df_updates = pd.DataFrame(columns=sample_columns)
     
     if add_claims:
         df_adds = pd.DataFrame(add_claims)
     else:
-        # Create empty DataFrame with expected columns from a sample QB claim
-        if not qb_claims_active.empty:
-            sample_columns = list(qb_claims_active.columns) + ['operation']
-        else:
-            # Fallback columns if no QB claims available
-            sample_columns = [
-                'claim_id', 'extracted_at', 'source', 'operation',
-                'Record # in Outage Management (QB)*', 'Site Name (QB)*', 'Technology (QB)*'
-            ]
+        # Create empty DataFrame with Smartsheet field names
+        sample_ss_fields = [f['ss_field'] for f in field_mapping.load_field_mapping()]
+        sample_columns = sample_ss_fields + ['operation', 'claim_id', 'extracted_at', 'source']
         df_adds = pd.DataFrame(columns=sample_columns)
     
     # Store in DuckDB with proper table creation
@@ -560,7 +553,7 @@ def batch_update_results(
                 status = 'success' if i < results.get('successful', 0) else 'failed'
                 
                 update_results.append({
-                    'claim_id': claim['claim_id'],
+                    'claim_id': claim["Record # in Outage Management (QB)*"],
                     'operation': 'update',
                     'status': status,
                     'batch_id': batch_id,
@@ -655,7 +648,7 @@ def batch_add_results(
             new_row_id = new_row_ids[i] if i < len(new_row_ids) else None
             
             add_results.append({
-                'claim_id': claim['claim_id'],
+                'claim_id': claim["Record # in Outage Management (QB)*"],
                 'operation': 'add',
                 'status': status,
                 'batch_id': batch_id,
@@ -738,7 +731,7 @@ def subtask_creation_results(
                     )
                     
                     subtask_results.append({
-                        'parent_claim_id': parent_info['claim_id'],
+                        'parent_claim_id': parent_info["Record # in Outage Management (QB)*"],
                         'parent_row_id': parent_info['parent_row_id'],
                         'subtasks_added': subtasks_added,
                         'status': 'success' if subtasks_added > 0 else 'failed',
@@ -748,7 +741,7 @@ def subtask_creation_results(
                 except Exception as e:
                     context.log.error(f"Failed to add subtasks for claim {parent_info['claim_id']}: {e}")
                     subtask_results.append({
-                        'parent_claim_id': parent_info['claim_id'],
+                        'parent_claim_id': parent_info["Record # in Outage Management (QB)*"],
                         'parent_row_id': parent_info['parent_row_id'],
                         'subtasks_added': 0,
                         'status': 'failed',
