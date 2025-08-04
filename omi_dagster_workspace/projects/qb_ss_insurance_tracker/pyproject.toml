@@ -7,6 +7,7 @@ dependencies = [
     "dagster-duckdb>=0.27.2",
     "dagster-duckdb-pandas>=0.27.2",
     "pandas>=2.3.1",
+    "pip>=25.2",
     "pyqb>=0.2.5",
     "python-dotenv>=1.1.1",
     "smartsheet-python-sdk>=3.0.5",
