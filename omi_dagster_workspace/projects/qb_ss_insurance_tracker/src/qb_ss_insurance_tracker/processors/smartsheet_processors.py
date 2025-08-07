@@ -12,6 +12,7 @@ from collections import defaultdict
 from dagster import AssetExecutionContext
 
 
+      
 class SmartsheetBatchProcessor:
     """
     Handles batch operations for Smartsheet API calls.
@@ -153,6 +154,8 @@ class SmartsheetBatchProcessor:
         
         return results
     
+    # --- START OF FIX ---
+    # This method is reverted to the correct implementation.
     def _create_bulk_update_rows(self, update_records: List[Dict], 
                                  column_mapping: Dict[str, int]) -> List[smartsheet.models.Row]:
         """Create bulk update rows for batch operation."""
@@ -162,13 +165,17 @@ class SmartsheetBatchProcessor:
             if "sheet_row_id" not in record:
                 continue
             
+            # CORRECT: Initialize the row first...
             row = smartsheet.models.Row()
+            # ...then set the ID.
             row.id = record["sheet_row_id"]
             
             for field_name, field_value in record.items():
+                # Skip metadata fields
                 if field_name in ["sheet_row_id", "operation", "claim_id", 
                                   "extracted_at", "source"]:
                     continue
+                # Add a cell if the field is in our column mapping
                 if field_name in column_mapping:
                     cell = smartsheet.models.Cell()
                     cell.column_id = column_mapping[field_name]
@@ -178,6 +185,7 @@ class SmartsheetBatchProcessor:
             update_rows.append(row)
         
         return update_rows
+    # --- END OF FIX ---
     
     def _create_bulk_add_rows(self, add_records: List[Dict], 
                              column_mapping: Dict[str, int]) -> List[smartsheet.models.Row]:
@@ -225,17 +233,32 @@ class SmartsheetBatchProcessor:
                 else:
                     return False, None, f"Invalid operation_type: {operation_type}"
                 
-                return True, response, None
+                # The SDK response object has a 'message' attribute which is 'SUCCESS' on success
+                if hasattr(response, 'message') and response.message == 'SUCCESS':
+                    return True, response, None
+                else:
+                    # Handle cases where the API returns a non-successful message without an exception
+                    error_msg = "Unknown Smartsheet API error"
+                    if hasattr(response, 'result') and hasattr(response.result, 'message'):
+                        error_msg = response.result.message
+                    
+                    if attempt < self.max_retries - 1:
+                        wait_time = 2 ** (attempt + 1)
+                        time.sleep(wait_time)
+                    else:
+                        return False, None, error_msg
                 
             except Exception as e:
                 error_msg = str(e)
                 if attempt < self.max_retries - 1:
-                    wait_time = 2 ** (attempt + 1)  # Exponential backoff
+                    wait_time = 2 ** (attempt + 1)
                     time.sleep(wait_time)
                 else:
                     return False, None, error_msg
         
         return False, None, "Max retries exceeded"
+
+    
 
 
 class TemplateProcessor:
@@ -243,308 +266,168 @@ class TemplateProcessor:
     Handles template-to-sheet mapping and subtask creation.
     Encapsulates all template processing logic.
     """
-    
-    # Template row indent mapping (defines hierarchy)
-    INDENT_MAP = {
-        1: 1,   # Phase
-        2: 2,   # Task
-        3: 1,   # Phase
-        4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 10: 2, 11: 2, 12: 2, 13: 2,  # Tasks
-        14: 1,  # Phase
-        15: 2, 16: 2, 17: 2, 18: 2, 19: 2, 20: 2, 21: 2, 22: 2  # Tasks
-    }
-    
-    def __init__(self, ss_client: smartsheet.Smartsheet, 
-                 template_sheet_id: int, main_sheet_id: int):
-        """
-        Initialize template processor.
-        
-        Args:
-            ss_client: Authenticated Smartsheet client
-            template_sheet_id: Template sheet ID
-            main_sheet_id: Main sheet ID where rows will be added
-        """
+    INDENT_MAP = {1: 1, 2: 2, 3: 1, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 10: 2, 11: 2, 12: 2, 13: 2, 14: 1, 15: 2, 16: 2, 17: 2, 18: 2, 19: 2, 20: 2, 21: 2, 22: 2}
+
+    def __init__(self, ss_client: smartsheet.Smartsheet, template_sheet_id: int, main_sheet_id: int):
         self.client = ss_client
         self.template_sheet_id = template_sheet_id
         self.main_sheet_id = main_sheet_id
         
-        # Load sheets
         self.template_sheet = self.client.Sheets.get_sheet(template_sheet_id)
-        self.main_sheet = self.client.Sheets.get_sheet(main_sheet_id, 
-                                                       include_all=False, 
-                                                       columns='all')
+        self.main_sheet = self.client.Sheets.get_sheet(main_sheet_id, page_size=1, page=1)
         
-        # Build column mapping
         self.column_map = self._build_column_mapping()
-        
-        # Prepare template rows
         self.template_rows = self._prepare_template_rows()
-    
+
     def _build_column_mapping(self) -> Dict[int, int]:
         """Map template column IDs to main sheet column IDs by title."""
-        mapping = {}
-        
-        # Create lookup of main sheet columns by title
         main_cols = {col.title: col.id for col in self.main_sheet.columns}
-        
-        # Map template columns to main sheet columns
-        for template_col in self.template_sheet.columns:
-            if template_col.title in main_cols:
-                mapping[template_col.id] = main_cols[template_col.title]
-        
-        return mapping
-    
+        return {
+            template_col.id: main_cols[template_col.title]
+            for template_col in self.template_sheet.columns if template_col.title in main_cols
+        }
+
+    # --- START OF FINAL FIX ---
     def _prepare_template_rows(self) -> List[Tuple[int, smartsheet.models.Row]]:
-        """
-        Prepare template rows with proper column mapping.
-        
-        Returns:
-            List of (template_index, prepared_row)
-        """
+        """Prepare template rows, ensuring all cells have a value attribute."""
         prepared = []
-        
         for idx, template_row in enumerate(self.template_sheet.rows, 1):
-            # Create new row with mapped columns
-            new_row = smartsheet.models.Row()
-            new_row.to_bottom = True
-            
-            # Map cells to main sheet columns
+            new_row = smartsheet.models.Row(to_bottom=True)
             for cell in template_row.cells:
                 if cell.column_id in self.column_map:
                     new_cell = smartsheet.models.Cell()
                     new_cell.column_id = self.column_map[cell.column_id]
                     
-                    # Copy cell content
-                    if hasattr(cell, 'value') and cell.value is not None:
-                        new_cell.value = cell.value
+                    # FIX: Default to an empty string '' instead of None to match the old working code's behavior.
+                    # This ensures the 'value' key is always present in the SDK's generated JSON.
+                    new_cell.value = getattr(cell, 'value', '')
+                    
+                    if hasattr(cell, 'formula') and cell.formula:
+                        new_cell.formula = cell.formula
                     if hasattr(cell, 'hyperlink') and cell.hyperlink:
-                        new_cell.hyperlink = smartsheet.models.Hyperlink({
-                            'url': cell.hyperlink.url
-                        })
+                        new_cell.hyperlink = smartsheet.models.Hyperlink({'url': cell.hyperlink.url})
                     
                     new_row.cells.append(new_cell)
-            
             prepared.append((idx, new_row))
-        
         return prepared
     
-    def apply_to_parent(self, parent_row_id: int, 
-                       context: Optional[AssetExecutionContext] = None) -> int:
-        """
-        Apply template structure under a parent row.
-        
-        Args:
-            parent_row_id: ID of the parent row
-            context: Optional Dagster context for logging
-            
-        Returns:
-            Number of rows successfully added
-        """
-        rows_added = 0
-        phase_mapping = {}  # Maps template index to created row ID
-        
-        # Step 1: Add all phase rows (indent level 1)
-        phase_rows = self._get_rows_by_indent(1)
-        
-        if phase_rows:
-            # Batch add all phases under the parent
-            batch = []
-            for template_idx, row in phase_rows:
-                row_copy = self._copy_row(row)
-                row_copy.parent_id = parent_row_id
-                batch.append((template_idx, row_copy))
-            
-            # Add batch and map results
-            added_phases = self._add_row_batch(batch, "phase", context)
-            phase_mapping.update(added_phases)
-            rows_added += len(added_phases)
-        
-        # Step 2: Group task rows by their parent phase
-        tasks_by_phase = self._group_tasks_by_phase()
-        
-        # Step 3: Add tasks under each phase
-        for phase_idx, task_indices in tasks_by_phase.items():
-            if phase_idx not in phase_mapping:
-                continue
-            
-            parent_phase_id = phase_mapping[phase_idx]
-            task_batch = []
-            
-            for task_idx in task_indices:
-                _, task_row = self.template_rows[task_idx - 1]
-                row_copy = self._copy_row(task_row)
-                row_copy.parent_id = parent_phase_id
-                task_batch.append((task_idx, row_copy))
-            
-            # Add task batch
-            if task_batch:
-                added_tasks = self._add_row_batch(task_batch, "task", context)
-                rows_added += len(added_tasks)
-        
-        return rows_added
-    
-    def _get_rows_by_indent(self, indent_level: int) -> List[Tuple[int, smartsheet.models.Row]]:
-        """Get all template rows with specified indent level."""
-        return [
-            (idx, row) for idx, row in self.template_rows
-            if self.INDENT_MAP.get(idx) == indent_level
-        ]
-    
-    def _group_tasks_by_phase(self) -> Dict[int, List[int]]:
-        """Group task indices by their parent phase index."""
-        groups = defaultdict(list)
-        
-        for idx in range(1, len(self.template_rows) + 1):
-            if self.INDENT_MAP.get(idx) == 2:  # Task level
-                # Find parent phase (walk backwards to find indent level 1)
-                for phase_idx in range(idx - 1, 0, -1):
-                    if self.INDENT_MAP.get(phase_idx) == 1:
-                        groups[phase_idx].append(idx)
-                        break
-        
-        return groups
-    
-    def _copy_row(self, row: smartsheet.models.Row) -> smartsheet.models.Row:
-        """Create a deep copy of a row."""
-        new_row = smartsheet.models.Row()
-        new_row.to_bottom = True
+    def _copy_row(self, row: smartsheet.models.Row, parent_id: Optional[int] = None) -> smartsheet.models.Row:
+        """Create a deep copy of a row for API submission."""
+        new_row = smartsheet.models.Row(to_bottom=True)
+        if parent_id:
+            new_row.parent_id = parent_id
         
         for cell in row.cells:
             new_cell = smartsheet.models.Cell()
             new_cell.column_id = cell.column_id
             
-            if hasattr(cell, 'value') and cell.value is not None:
-                new_cell.value = cell.value
+            # FIX: Also use the empty string '' default here for consistency.
+            new_cell.value = getattr(cell, 'value', '')
+            
+            if hasattr(cell, 'formula') and cell.formula:
+                new_cell.formula = cell.formula
             if hasattr(cell, 'hyperlink') and cell.hyperlink:
-                new_cell.hyperlink = smartsheet.models.Hyperlink({
-                    'url': cell.hyperlink.url
-                })
-            
+                new_cell.hyperlink = smartsheet.models.Hyperlink({'url': cell.hyperlink.url})
+                
             new_row.cells.append(new_cell)
-        
         return new_row
+    # --- END OF FINAL FIX ---
+
+    def apply_to_parent(self, parent_row_id: int, context: Optional[AssetExecutionContext] = None) -> int:
+        """Apply template structure under a parent row."""
+        rows_added = 0
+        phase_mapping = {}
+
+        # Add phases (indent 1)
+        phase_rows_to_add = [(idx, self._copy_row(row, parent_id=parent_row_id)) for idx, row in self._get_rows_by_indent(1)]
+        if phase_rows_to_add:
+            added_phases = self._add_row_batch(phase_rows_to_add, "phase", context)
+            phase_mapping.update(added_phases)
+            rows_added += len(added_phases)
+
+        # Add tasks (indent 2)
+        tasks_by_phase = self._group_tasks_by_phase()
+        for phase_idx, task_indices in tasks_by_phase.items():
+            if phase_idx in phase_mapping:
+                parent_phase_id = phase_mapping[phase_idx]
+                task_rows_to_add = [
+                    (task_idx, self._copy_row(self.template_rows[task_idx - 1][1], parent_id=parent_phase_id))
+                    for task_idx in task_indices
+                ]
+                if task_rows_to_add:
+                    added_tasks = self._add_row_batch(task_rows_to_add, "task", context)
+                    rows_added += len(added_tasks)
+        return rows_added
+
+    def _get_rows_by_indent(self, indent_level: int) -> List[Tuple[int, smartsheet.models.Row]]:
+        """Get all template rows with a specified indent level."""
+        return [(idx, row) for idx, row in self.template_rows if self.INDENT_MAP.get(idx) == indent_level]
+
+    def _group_tasks_by_phase(self) -> Dict[int, List[int]]:
+        """Group task indices under their corresponding parent phase index."""
+        groups = defaultdict(list)
+        current_phase_idx = -1
+        for idx in range(1, len(self.template_rows) + 1):
+            indent = self.INDENT_MAP.get(idx)
+            if indent == 1: current_phase_idx = idx
+            elif indent == 2 and current_phase_idx != -1: groups[current_phase_idx].append(idx)
+        return groups
     
-    def _add_row_batch(self, rows: List[Tuple[int, smartsheet.models.Row]], 
-                      row_type: str, 
-                      context: Optional[AssetExecutionContext] = None) -> Dict[int, int]:
-        """
-        Add a batch of rows and return mapping of template_idx to row_id.
-        
-        Args:
-            rows: List of (template_index, row) tuples
-            row_type: Type of rows being added (for logging)
-            context: Optional Dagster context for logging
-            
-        Returns:
-            Dict mapping template indices to created row IDs
-        """
+    def _add_row_batch(self, rows: List[Tuple[int, smartsheet.models.Row]], row_type: str, context: Optional[AssetExecutionContext] = None) -> Dict[int, int]:
+        """Add a batch of rows and return a mapping of template_idx to new row_id."""
         mapping = {}
+        if not rows: return mapping
         
-        if not rows:
-            return mapping
-        
-        # Try batch add first
+        row_objects = [row for _, row in rows]
         try:
-            row_objects = [row for _, row in rows]
             response = self.client.Sheets.add_rows(self.main_sheet_id, row_objects)
-            
-            # Map results
-            if hasattr(response, 'result'):
+            if response.message == 'SUCCESS':
                 for i, row_result in enumerate(response.result):
-                    if i < len(rows):
-                        template_idx = rows[i][0]
-                        mapping[template_idx] = row_result.id
-            
-            if context:
-                context.log.debug(f"Batch added {len(mapping)} {row_type} rows")
-            
+                    mapping[rows[i][0]] = row_result.id
+                if context: context.log.debug(f"Batch added {len(mapping)} {row_type} rows.")
+            else:
+                raise Exception(f"API Error: {response.result.message}")
         except Exception as e:
-            if context:
-                context.log.warning(f"Batch add failed: {e}. Falling back to individual adds")
-            
-            # Fall back to individual adds
+            if context: context.log.warning(f"Batch add failed: {e}. Falling back to individual adds.")
+            # Fallback for debugging purposes
             for template_idx, row in rows:
                 try:
                     response = self.client.Sheets.add_rows(self.main_sheet_id, [row])
-                    if hasattr(response, 'result') and response.result:
+                    if response.message == 'SUCCESS':
                         mapping[template_idx] = response.result[0].id
+                    else:
+                        if context: context.log.error(f"Failed to add {row_type} row {template_idx}. API Error: {response.result.message}")
                 except Exception as add_error:
-                    if context:
-                        context.log.error(f"Failed to add {row_type} row {template_idx}: {add_error}")
-        
+                    if context: context.log.error(f"Exception on individual add for {row_type} row {template_idx}: {add_error}")
         return mapping
 
 
 class ColumnFormulaManager:
-    """
-    Manages column formulas during batch operations.
-    Temporarily disables and re-enables formulas to allow updates.
-    """
-    
+    """Manages column formulas during batch operations."""
     def __init__(self, ss_client: smartsheet.Smartsheet, sheet_id: int):
-        """
-        Initialize formula manager.
-        
-        Args:
-            ss_client: Authenticated Smartsheet client
-            sheet_id: Target sheet ID
-        """
         self.client = ss_client
         self.sheet_id = sheet_id
         self.formula_storage = {}
-    
-    def disable_formulas(self, field_names: List[str]) -> Dict[int, str]:
-        """
-        Disable column formulas for specified fields.
-        
-        Args:
-            field_names: List of field names to check for formulas
-            
-        Returns:
-            Dict mapping column IDs to their formulas
-        """
+
+    def disable_formulas(self, field_names: List[str]):
+        """Disable column formulas for specified fields."""
         try:
             sheet = self.client.Sheets.get_sheet(self.sheet_id)
-            
             for col in sheet.columns:
                 if col.title in field_names and hasattr(col, 'formula') and col.formula:
                     self.formula_storage[col.id] = col.formula
-                    
-                    # Create updated column without formula
-                    update_col = smartsheet.models.Column({
-                        'title': col.title,
-                        'type': col.type,
-                        'formula': ""
-                    })
-                    
+                    update_col = smartsheet.models.Column({'id': col.id, 'formula': ""})
                     self.client.Sheets.update_column(self.sheet_id, col.id, update_col)
-            
         except Exception as e:
             print(f"Failed to disable column formulas: {e}")
-        
-        return self.formula_storage
-    
-    def enable_formulas(self) -> None:
+
+    def enable_formulas(self):
         """Re-enable all previously disabled formulas."""
-        if not self.formula_storage:
-            return
-        
+        if not self.formula_storage: return
         try:
-            sheet = self.client.Sheets.get_sheet(self.sheet_id)
-            
-            for col in sheet.columns:
-                if col.id in self.formula_storage:
-                    # Create updated column with formula
-                    update_col = smartsheet.models.Column({
-                        'title': col.title,
-                        'type': col.type,
-                        'formula': self.formula_storage[col.id]
-                    })
-                    
-                    self.client.Sheets.update_column(self.sheet_id, col.id, update_col)
-            
-            # Clear storage after re-enabling
+            for col_id, formula_text in self.formula_storage.items():
+                update_col = smartsheet.models.Column({'id': col_id, 'formula': formula_text})
+                self.client.Sheets.update_column(self.sheet_id, col_id, update_col)
             self.formula_storage.clear()
-            
         except Exception as e:
             print(f"Failed to re-enable column formulas: {e}")

@@ -12,6 +12,11 @@ from dagster_duckdb import DuckDBResource
 from qb_ss_insurance_tracker.resources.smartsheet_resource import SmartsheetResource
 from qb_ss_insurance_tracker.resources.config_resource import FieldMappingResource
 from qb_ss_insurance_tracker.utils import get_sheet_column_mapping, extract_claim_row_mapping, make_json_serializable
+from qb_ss_insurance_tracker.processors.smartsheet_processors import (
+    SmartsheetBatchProcessor,
+    TemplateProcessor,
+    ColumnFormulaManager
+)
 
 class SmartsheetConfig(Config):
     """Configuration for Smartsheet operations"""
@@ -556,7 +561,10 @@ def batch_update_results(
         
         # Disable formulas before updates
         context.log.info("Disabling column formulas...")
-        formula_jail = _disable_column_formulas(ss_client, sheet_id, mapping, context)
+        # formula_jail = _disable_column_formulas(ss_client, sheet_id, mapping, context)
+        formula_manager = ColumnFormulaManager(ss_client, sheet_id)
+        field_names_to_check = [field['ss_field'] for field in mapping]
+        formula_manager.disable_formulas(field_names_to_check)
         
         try:
             # Process updates
@@ -582,7 +590,8 @@ def batch_update_results(
         finally:
             # Re-enable formulas
             context.log.info("Re-enabling column formulas...")
-            _enable_column_formulas(ss_client, sheet_id, formula_jail, context)
+            # _enable_column_formulas(ss_client, sheet_id, formula_jail, context)
+            formula_manager.enable_formulas()
     
     # Store results
     with database.get_connection() as conn:
@@ -708,79 +717,94 @@ def subtask_creation_results(
     """Add subtasks to newly created parent rows using fixed JSON parsing"""
     
     context.log.info("Adding subtasks to new parent rows...")
+    start_time = time.time()
     
-    # Load successful additions and template data
+    # Load data from DuckDB
     with database.get_connection() as conn:
-        df_add_results = conn.execute("SELECT * FROM smartsheet.batch_add_results WHERE status = 'success'").fetch_df()
-        sheet_urls = conn.execute("SELECT * FROM smartsheet.sheet_urls WHERE sheet_type = 'main'").fetch_df()
+        df_add_results = conn.execute(
+            "SELECT * FROM smartsheet.batch_add_results WHERE status = 'success'"
+        ).fetch_df()
         
-        # Get the raw template and main sheet data
-        template_raw = conn.execute("SELECT template_data FROM smartsheet.template_sheet_raw").fetch_df()
-        main_sheet_raw = conn.execute("SELECT sheet_data FROM smartsheet.main_sheet_raw").fetch_df()
+        if df_add_results.empty:
+            context.log.info("No new parent rows to process")
+            # Create empty result
+            df_empty = pd.DataFrame(columns=[
+                'parent_claim_id', 'parent_row_id', 'subtasks_added', 
+                'status', 'processed_at'
+            ])
+            conn.execute(
+                "CREATE OR REPLACE TABLE smartsheet.subtask_creation_results AS SELECT * FROM df_empty"
+            )
+            return MaterializeResult(
+                metadata={
+                    "total_subtasks_added": 0,
+                    "successful_parents": 0,
+                    "table_name": "smartsheet.subtask_creation_results"
+                }
+            )
+        
+        # Get sheet IDs
+        sheet_info = conn.execute(
+            "SELECT sheet_id FROM smartsheet.sheet_urls WHERE sheet_type = 'main'"
+        ).fetch_df()
+        template_info = conn.execute(
+            "SELECT sheet_id FROM smartsheet.sheet_urls WHERE sheet_type = 'template'"
+        ).fetch_df()
     
-    if df_add_results.empty:
-        context.log.info("No new parent rows to process for subtasks")
-        df_subtask_results = pd.DataFrame(columns=['parent_claim_id', 'parent_row_id', 'subtasks_added', 'status', 'processed_at'])
-    else:
-        # Parse the JSON data properly
-        template_data = json.loads(template_raw.iloc[0]['template_data'])  # Use json.loads instead of ast.literal_eval
-        main_data = json.loads(main_sheet_raw.iloc[0]['sheet_data'])      # Use json.loads instead of ast.literal_eval
-        
-        # Prepare parent row info
-        parent_rows_info = []
-        for _, row in df_add_results.iterrows():
-            if pd.notna(row['new_row_id']):
-                parent_rows_info.append({
-                    'claim_id': row['claim_id'],
-                    'parent_row_id': int(row['new_row_id'])
-                })
-        
-        if not parent_rows_info:
-            context.log.warning("No valid parent row IDs found")
-            df_subtask_results = pd.DataFrame(columns=['parent_claim_id', 'parent_row_id', 'subtasks_added', 'status', 'processed_at'])
-        else:
-            sheet_url = sheet_urls.iloc[0]['sheet_url']
-            ss_client = smartsheet_client.get_client()
+    # Initialize SDK client
+    ss_client = smartsheet_client.get_client()
+    main_sheet_id = int(sheet_info.iloc[0]['sheet_id'])
+    template_sheet_id = int(template_info.iloc[0]['sheet_id'])
+    
+    # USE THE NEW TemplateProcessor
+    template_processor = TemplateProcessor(ss_client, template_sheet_id, main_sheet_id)
+    
+    # Process each new parent row
+    results = []
+    for _, row in df_add_results.iterrows():
+        if pd.notna(row['new_row_id']):
+            parent_row_id = int(row['new_row_id'])
+            claim_id = row['claim_id']
             
-            # Add subtasks using the working logic
-            successful_additions = add_subtasks_with_proper_mapping(
-                ss_client, sheet_url, parent_rows_info,
-                template_data, main_data, context
+            context.log.info(f"Adding subtasks for claim {claim_id}")
+            
+            # Add subtasks using the clean TemplateProcessor
+            subtasks_added = template_processor.apply_to_parent(
+                parent_row_id, context
             )
             
-            # Create results for each parent
-            subtask_results = []
-            for parent_info in parent_rows_info:
-                # Estimate subtasks per parent (22 template rows typically)
-                subtasks_per_parent = successful_additions // len(parent_rows_info) if parent_rows_info else 0
-                
-                subtask_results.append({
-                    'parent_claim_id': parent_info['claim_id'],
-                    'parent_row_id': parent_info['parent_row_id'],
-                    'subtasks_added': subtasks_per_parent,
-                    'status': 'success' if subtasks_per_parent > 0 else 'failed',
-                    'processed_at': pd.Timestamp.now()
-                })
-            
-            df_subtask_results = pd.DataFrame(subtask_results)
+            results.append({
+                'parent_claim_id': claim_id,
+                'parent_row_id': parent_row_id,
+                'subtasks_added': subtasks_added,
+                'status': 'success' if subtasks_added > 0 else 'failed',
+                'processed_at': pd.Timestamp.now()
+            })
     
-    # Store results
+    # Store and return results
+    df_results = pd.DataFrame(results)
     with database.get_connection() as conn:
-        conn.execute("CREATE OR REPLACE TABLE smartsheet.subtask_creation_results AS SELECT * FROM df_subtask_results")
+        conn.execute(
+            "CREATE OR REPLACE TABLE smartsheet.subtask_creation_results AS SELECT * FROM df_results"
+        )
     
-    total_subtasks = df_subtask_results['subtasks_added'].sum() if not df_subtask_results.empty else 0
-    successful_parents = len(df_subtask_results[df_subtask_results['status'] == 'success']) if not df_subtask_results.empty else 0
+    elapsed = time.time() - start_time
+    total_subtasks = df_results['subtasks_added'].sum()
     
-    context.log.info(f"Subtask creation completed: {total_subtasks} subtasks added across {successful_parents} parent rows")
+    context.log.info(
+        f"Added {total_subtasks} subtasks in {elapsed:.1f} seconds "
+        f"({elapsed/len(results):.1f}s per claim)"
+    )
     
     return MaterializeResult(
         metadata={
             "total_subtasks_added": int(total_subtasks),
-            "successful_parents": successful_parents,
-            "failed_parents": len(df_subtask_results[df_subtask_results['status'] == 'failed']) if not df_subtask_results.empty else 0,
+            "successful_parents": len(df_results[df_results['status'] == 'success']),
+            "processing_time_seconds": elapsed,
             "table_name": "smartsheet.subtask_creation_results"
         }
     )
+
 
 @asset(
     description="Final processing summary and performance metrics",
@@ -880,374 +904,3 @@ def processing_summary(
             "table_name": "reporting.processing_summary"
         }
     )
-# Helper classes and functions
-
-class SmartsheetBatchProcessor:
-    """Handles batch operations for Smartsheet API calls"""
-    
-    def __init__(self, ss_client, sheet_id, max_batch_size=100, max_retries=3):
-        self.ss_client = ss_client
-        self.sheet_id = sheet_id
-        self.max_batch_size = max_batch_size
-        self.max_retries = max_retries
-    
-    def process_update_batches(self, update_records, column_mapping):
-        """Process update records in batches"""
-        if not update_records:
-            return {"total_records": 0, "successful": 0, "failed": 0}
-        
-        results = {"total_records": len(update_records), "successful": 0, "failed": 0}
-        total_batches = math.ceil(len(update_records) / self.max_batch_size)
-        
-        for i in range(0, len(update_records), self.max_batch_size):
-            batch_records = update_records[i:i + self.max_batch_size]
-            batch_num = (i // self.max_batch_size) + 1
-            
-            # Create batch rows
-            batch_rows = self._create_bulk_update_rows(batch_records, column_mapping)
-            
-            # Execute batch with retry
-            success, response, error_msg = self._batch_operation_with_retry(batch_rows, "update")
-            
-            if success:
-                results["successful"] += len(batch_rows)
-            else:
-                results["failed"] += len(batch_rows)
-            
-            # Rate limiting
-            if batch_num < total_batches:
-                time.sleep(1)
-        
-        return results
-    
-    def process_add_batches(self, add_records, column_mapping):
-        """Process add records in batches"""
-        if not add_records:
-            return {"total_records": 0, "successful": 0, "failed": 0, "new_row_ids": []}
-        
-        results = {"total_records": len(add_records), "successful": 0, "failed": 0, "new_row_ids": []}
-        total_batches = math.ceil(len(add_records) / self.max_batch_size)
-        
-        for i in range(0, len(add_records), self.max_batch_size):
-            batch_records = add_records[i:i + self.max_batch_size]
-            batch_num = (i // self.max_batch_size) + 1
-            
-            # Create batch rows
-            batch_rows = self._create_bulk_add_rows(batch_records, column_mapping)
-            
-            # Execute batch with retry
-            success, response, error_msg = self._batch_operation_with_retry(batch_rows, "add")
-            
-            if success:
-                results["successful"] += len(batch_rows)
-                # Extract new row IDs
-                if response and hasattr(response, 'result'):
-                    for row_result in response.result:
-                        if hasattr(row_result, 'id'):
-                            results["new_row_ids"].append(row_result.id)
-            else:
-                results["failed"] += len(batch_rows)
-            
-            # Rate limiting
-            if batch_num < total_batches:
-                time.sleep(1)
-        
-        return results
-    
-    def _create_bulk_update_rows(self, update_records, column_mapping):
-        """Create bulk update rows for batch operation"""
-        update_rows = []
-        
-        for record in update_records:
-            if "sheet_row_id" not in record:
-                continue
-            
-            row = smartsheet.models.Row()
-            row.id = record["sheet_row_id"]
-            
-            for field_name, field_value in record.items():
-                if field_name in ["sheet_row_id", "operation", "claim_id", "extracted_at", "source"]:
-                    continue
-                if field_name in column_mapping:
-                    cell = smartsheet.models.Cell()
-                    cell.column_id = column_mapping[field_name]
-                    cell.value = field_value
-                    row.cells.append(cell)
-            
-            update_rows.append(row)
-        
-        return update_rows
-    
-    def _create_bulk_add_rows(self, add_records, column_mapping):
-        """Create bulk add rows for batch operation"""
-        add_rows = []
-        
-        for record in add_records:
-            row = smartsheet.models.Row()
-            
-            for field_name, field_value in record.items():
-                if field_name in ["operation", "claim_id", "extracted_at", "source"]:
-                    continue
-                    
-                if field_name == "Claim Name / Task Name" and field_name in column_mapping:
-                    # Add formula for claim name
-                    cell = smartsheet.models.Cell()
-                    cell.column_id = column_mapping[field_name]
-                    cell.formula = "=IF([Record # in Outage Management (QB)*]@row <> 0, [Site Name (QB)*]@row + \" -  \" + [Accident Description]@row, \"\")"
-                    row.cells.append(cell)
-                elif field_name in column_mapping:
-                    cell = smartsheet.models.Cell()
-                    cell.column_id = column_mapping[field_name]
-                    cell.value = field_value
-                    row.cells.append(cell)
-            
-            add_rows.append(row)
-        
-        return add_rows
-    
-    def _batch_operation_with_retry(self, rows_batch, operation_type):
-        """Execute batch operation with retry logic"""
-        for attempt in range(self.max_retries):
-            try:
-                if operation_type == "update":
-                    response = self.ss_client.Sheets.update_rows(self.sheet_id, rows_batch)
-                elif operation_type == "add":
-                    response = self.ss_client.Sheets.add_rows(self.sheet_id, rows_batch)
-                else:
-                    return False, None, f"Invalid operation_type: {operation_type}"
-                
-                return True, response, None
-                
-            except Exception as e:
-                error_msg = str(e)
-                if attempt < self.max_retries - 1:
-                    wait_time = 2 ** (attempt + 1)
-                    time.sleep(wait_time)
-                else:
-                    return False, None, error_msg
-
-def _disable_column_formulas(ss_client, sheet_id, field_mapping, context):
-    """Disable column formulas before batch operations"""
-    formula_jail = {}
-    
-    try:
-        # Get sheet data
-        sheet = ss_client.Sheets.get_sheet(int(sheet_id))
-        
-        # Find columns with formulas
-        sheet_col_names = [f['ss_field'] for f in field_mapping]
-        
-        for col in sheet.columns:
-            if col.title in sheet_col_names and hasattr(col, 'formula') and col.formula:
-                context.log.info(f"Disabling formula in column: {col.title}")
-                formula_jail[col.id] = col.formula
-                
-                # Create updated column without formula
-                update_col = smartsheet.models.Column({
-                    'title': col.title,
-                    'type': col.type,
-                    'formula': ""
-                })
-                
-                ss_client.Sheets.update_column(int(sheet_id), col.id, update_col)
-        
-        if formula_jail:
-            context.log.info(f"Disabled {len(formula_jail)} column formulas")
-        
-    except Exception as e:
-        context.log.warning(f"Failed to disable column formulas: {e}")
-    
-    return formula_jail
-
-def _enable_column_formulas(ss_client, sheet_id, formula_jail, context):
-    """Re-enable column formulas after batch operations"""
-    if not formula_jail:
-        return
-    
-    try:
-        # Get fresh sheet data
-        sheet = ss_client.Sheets.get_sheet(int(sheet_id))
-        
-        for col in sheet.columns:
-            if col.id in formula_jail:
-                context.log.info(f"Re-enabling formula in column: {col.title}")
-                
-                # Create updated column with formula
-                update_col = smartsheet.models.Column({
-                    'title': col.title,
-                    'type': col.type,
-                    'formula': formula_jail[col.id]
-                })
-                
-                ss_client.Sheets.update_column(int(sheet_id), col.id, update_col)
-        
-        context.log.info(f"Re-enabled {len(formula_jail)} column formulas")
-        
-    except Exception as e:
-        context.log.error(f"Failed to re-enable column formulas: {e}")
-
-
-def add_subtasks_with_proper_mapping(ss_client, sheet_url, parent_rows_info, 
-                                     template_sheet_data, main_sheet_data, context):
-    """
-    Add subtasks using the exact logic from the working update_sheet.py
-    This matches the working get_nested_rows and add_subtasks_with_grouping functions
-    """
-    context.log.info("Adding subtasks with proper column mapping...")
-    
-    # Get nested rows with proper column mapping
-    template_rows = get_nested_rows_proper(main_sheet_data, template_sheet_data)
-    
-    # Use the exact template indent mapping from working code
-    template_indent_mapping = {
-        1: "1", 2: "2", 3: "1", 4: "2", 5: "2", 6: "2", 7: "2", 8: "2", 
-        9: "2", 10: "2", 11: "2", 12: "2", 13: "2", 14: "1", 15: "2", 
-        16: "2", 17: "2", 18: "2", 19: "2", 20: "2", 21: "2", 22: "2"
-    }
-    
-    successful_additions = 0
-    
-    for parent_info in parent_rows_info:
-        parent_row_id = parent_info["parent_row_id"]
-        claim_id = parent_info.get("claim_id", "unknown")
-        
-        context.log.info(f"Adding subtasks for claim {claim_id}...")
-        
-        # Add level 1 rows (phases) first
-        phase_mapping = {}
-        
-        for idx, template_row in enumerate(template_rows, 1):
-            if template_indent_mapping.get(idx) == "1":
-                row_data = template_row.copy()
-                row_data["parentId"] = parent_row_id
-                row_data["toBottom"] = True
-                
-                # Add with retry logic
-                for attempt in range(3):
-                    try:
-                        response = add_row_from_json_proper(sheet_url, row_data, context)
-                        if "result" in response and "id" in response["result"]:
-                            phase_mapping[idx] = response["result"]["id"]
-                            successful_additions += 1
-                            context.log.debug(f"Added phase row {idx}")
-                            break
-                    except Exception as e:
-                        context.log.warning(f"Phase row attempt {attempt + 1}/3 failed: {e}")
-                        if attempt < 2:
-                            time.sleep(2)
-        
-        # Add level 2 rows (tasks)
-        from collections import defaultdict
-        level_2_groups = defaultdict(list)
-        
-        for idx, template_row in enumerate(template_rows, 1):
-            if template_indent_mapping.get(idx) == "2":
-                # Find parent phase
-                parent_phase_idx = None
-                for phase_idx in range(idx - 1, 0, -1):
-                    if template_indent_mapping.get(phase_idx) == "1":
-                        parent_phase_idx = phase_idx
-                        break
-                
-                if parent_phase_idx and parent_phase_idx in phase_mapping:
-                    parent_phase_id = phase_mapping[parent_phase_idx]
-                    row_data = template_row.copy()
-                    row_data["parentId"] = parent_phase_id
-                    row_data["toBottom"] = True
-                    level_2_groups[parent_phase_id].append(row_data)
-        
-        # Add level 2 rows
-        for parent_phase_id, phase_rows in level_2_groups.items():
-            for row_data in phase_rows:
-                for attempt in range(3):
-                    try:
-                        response = add_row_from_json_proper(sheet_url, row_data, context)
-                        if "result" in response and "id" in response["result"]:
-                            successful_additions += 1
-                            break
-                    except Exception as e:
-                        context.log.warning(f"Task row attempt {attempt + 1}/3 failed: {e}")
-                        if attempt < 2:
-                            time.sleep(2)
-    
-    context.log.info(f"Subtask addition completed. {successful_additions} rows added successfully.")
-    return successful_additions
-
-
-def get_nested_rows_proper(main_sheet_data, template_sheet_data):
-    """
-    Create nested rows with proper column ID mapping.
-    This matches the exact logic from the working get_nested_rows function.
-    """
-    # Get column titles from template for matching
-    template_col_names = [col['title'] for col in template_sheet_data['columns']]
-    main_sheet_colid_lookup = {}
-    
-    # Build the column ID mapping: {template_col_id: main_sheet_col_id}
-    for template_col in template_sheet_data['columns']:
-        template_name = template_col['title']
-        template_id = template_col['id']
-        
-        # Find matching column in main sheet by title
-        for main_col in main_sheet_data['columns']:
-            if main_col['title'] == template_name:
-                main_sheet_colid_lookup[template_id] = main_col['id']
-                break
-    
-    # Process template rows
-    new_template_rows = []
-    for row in template_sheet_data['rows']:
-        new_row_from_template = {}
-        current_row_cells = []
-        
-        for cell in row['cells']:
-            template_col_id = cell['columnId']
-            
-            # Get the destination column ID
-            dest_col_id = main_sheet_colid_lookup.get(template_col_id)
-            if not dest_col_id:
-                continue  # Skip if no matching column
-            
-            # Get cell value
-            value_from_template = cell.get('value', '')
-            
-            # Build cell data
-            cell_data = {
-                'columnId': dest_col_id,
-                'value': value_from_template
-            }
-            
-            # Add hyperlink if present
-            if 'hyperlink' in cell:
-                cell_data['hyperlink'] = cell['hyperlink']
-            
-            current_row_cells.append(cell_data)
-        
-        new_row_from_template["cells"] = current_row_cells
-        new_template_rows.append(new_row_from_template)
-    
-    return new_template_rows
-
-
-
-def add_row_from_json_proper(url, row_as_json, context):
-    """
-    Add a row to Smartsheet via API with proper headers
-    """
-    import os
-    import requests
-    
-    bearer = os.environ.get("SMARTSHEETS_TOKEN")
-    headers = {
-        "Authorization": f"Bearer {bearer}",
-        "Content-Type": "application/json"  # Fixed from ContentType
-    }
-    
-    row_url = url + "/rows"
-    
-    response = requests.post(row_url, headers=headers, json=row_as_json, verify=False)
-    
-    if response.status_code not in [200, 201]:
-        raise Exception(f"Failed to add row: {response.status_code} - {response.text}")
-    
-    return response.json()
