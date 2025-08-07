@@ -258,15 +258,36 @@ class SmartsheetBatchProcessor:
         
         return False, None, "Max retries exceeded"
 
-    
-
 
 class TemplateProcessor:
     """
     Handles template-to-sheet mapping and subtask creation.
     Encapsulates all template processing logic.
     """
-    INDENT_MAP = {1: 1, 2: 2, 3: 1, 4: 2, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 10: 2, 11: 2, 12: 2, 13: 2, 14: 1, 15: 2, 16: 2, 17: 2, 18: 2, 19: 2, 20: 2, 21: 2, 22: 2}
+    INDENT_MAP = {
+        1: 1,  # Phase I
+        2: 2,  # -> Task
+        3: 1,  # Phase II
+        4: 2,  # -> Task
+        5: 2,  # -> Task
+        6: 2,  # -> Task
+        7: 2,  # -> Task
+        8: 2,  # -> Task
+        9: 2,  # -> Task
+        10: 2, # -> Task
+        11: 2, # -> Task
+        12: 2, # -> Task
+        13: 1, # Phase III
+        14: 2, # -> Task
+        15: 2,  # -> Task
+        16: 2, # just in case
+        17: 2,
+        18: 2,
+        19: 2,
+        20: 2,
+        21: 2,
+        22: 2
+    }
 
     def __init__(self, ss_client: smartsheet.Smartsheet, template_sheet_id: int, main_sheet_id: int):
         self.client = ss_client
@@ -289,45 +310,62 @@ class TemplateProcessor:
 
     # --- START OF FINAL FIX ---
     def _prepare_template_rows(self) -> List[Tuple[int, smartsheet.models.Row]]:
-        """Prepare template rows, ensuring all cells have a value attribute."""
+        """
+        Prepare template rows, ONLY creating cells that have content.
+        This avoids the 'cell.value' error by not creating empty cells.
+        """
         prepared = []
         for idx, template_row in enumerate(self.template_sheet.rows, 1):
-            new_row = smartsheet.models.Row(to_bottom=True)
+            new_row = smartsheet.models.Row()
+            new_row.to_bottom = True
+
             for cell in template_row.cells:
-                if cell.column_id in self.column_map:
+                # Condition: Only proceed if the cell has content and a mapped column.
+                has_value = hasattr(cell, 'value') and cell.value is not None
+                has_formula = hasattr(cell, 'formula') and cell.formula
+                has_hyperlink = hasattr(cell, 'hyperlink') and cell.hyperlink
+
+                if (has_value or has_formula or has_hyperlink) and cell.column_id in self.column_map:
                     new_cell = smartsheet.models.Cell()
                     new_cell.column_id = self.column_map[cell.column_id]
                     
-                    # FIX: Default to an empty string '' instead of None to match the old working code's behavior.
-                    # This ensures the 'value' key is always present in the SDK's generated JSON.
-                    new_cell.value = getattr(cell, 'value', '')
+                    # Set value attribute. Default to '' if there's no value but a formula/hyperlink exists.
+                    if has_value:
+                        new_cell.value = cell.value
+                    else:
+                        new_cell.value = '' # API requires value key, even if empty, when other keys are present.
                     
-                    if hasattr(cell, 'formula') and cell.formula:
+                    if has_formula:
                         new_cell.formula = cell.formula
-                    if hasattr(cell, 'hyperlink') and cell.hyperlink:
+                    if has_hyperlink:
                         new_cell.hyperlink = smartsheet.models.Hyperlink({'url': cell.hyperlink.url})
                     
                     new_row.cells.append(new_cell)
+
             prepared.append((idx, new_row))
         return prepared
     
     def _copy_row(self, row: smartsheet.models.Row, parent_id: Optional[int] = None) -> smartsheet.models.Row:
-        """Create a deep copy of a row for API submission."""
-        new_row = smartsheet.models.Row(to_bottom=True)
+        """
+        Create a deep copy of a prepared row. The input row already has filtered cells.
+        """
+        new_row = smartsheet.models.Row()
+        new_row.to_bottom = True
+
         if parent_id:
             new_row.parent_id = parent_id
         
+        # The row object passed in has already been filtered, so we can just copy its cells.
         for cell in row.cells:
+            # Create a new cell to avoid any object reference issues
             new_cell = smartsheet.models.Cell()
             new_cell.column_id = cell.column_id
-            
-            # FIX: Also use the empty string '' default here for consistency.
-            new_cell.value = getattr(cell, 'value', '')
-            
+            new_cell.value = cell.value
+
             if hasattr(cell, 'formula') and cell.formula:
                 new_cell.formula = cell.formula
             if hasattr(cell, 'hyperlink') and cell.hyperlink:
-                new_cell.hyperlink = smartsheet.models.Hyperlink({'url': cell.hyperlink.url})
+                new_cell.hyperlink = cell.hyperlink
                 
             new_row.cells.append(new_cell)
         return new_row
@@ -338,14 +376,12 @@ class TemplateProcessor:
         rows_added = 0
         phase_mapping = {}
 
-        # Add phases (indent 1)
         phase_rows_to_add = [(idx, self._copy_row(row, parent_id=parent_row_id)) for idx, row in self._get_rows_by_indent(1)]
         if phase_rows_to_add:
             added_phases = self._add_row_batch(phase_rows_to_add, "phase", context)
             phase_mapping.update(added_phases)
             rows_added += len(added_phases)
 
-        # Add tasks (indent 2)
         tasks_by_phase = self._group_tasks_by_phase()
         for phase_idx, task_indices in tasks_by_phase.items():
             if phase_idx in phase_mapping:
@@ -389,7 +425,6 @@ class TemplateProcessor:
                 raise Exception(f"API Error: {response.result.message}")
         except Exception as e:
             if context: context.log.warning(f"Batch add failed: {e}. Falling back to individual adds.")
-            # Fallback for debugging purposes
             for template_idx, row in rows:
                 try:
                     response = self.client.Sheets.add_rows(self.main_sheet_id, [row])
