@@ -20,8 +20,8 @@ from qb_ss_insurance_tracker.processors.smartsheet_processors import (
 
 class SmartsheetConfig(Config):
     """Configuration for Smartsheet operations"""
-    # main_sheet_name: str = "O&M Insurance Claim Tracker"
-    main_sheet_name: str = "TESTING - Insurance Claim Tracker New" #changed for testing
+    main_sheet_name: str = "O&M Insurance Claim Tracker"
+    # main_sheet_name: str = "TESTING - Insurance Claim Tracker New" #changed for testing
     template_sheet_name: str = "O&M Insurance Claim Task Tracker Template"
     archive_sheet_name: str = "O&M Insurance Claim ARCHIVE-Below Deductible/Other"
     max_batch_size: int = 100
